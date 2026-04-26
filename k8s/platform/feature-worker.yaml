@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-worker
+  namespace: forkwise-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feature-worker }
+  template:
+    metadata:
+      labels: { app: feature-worker }
+    spec:
+      containers:
+      - name: feature-worker
+        image: ghcr.io/krishan101/forkwise-feature-worker:0.1.0
+        env:
+        - { name: POSTGRES_HOST, value: "platform-db" }
+        - { name: POSTGRES_PORT, value: "5432" }
+        - { name: POSTGRES_DB, value: "forkwise_mlops" }
+        - { name: POSTGRES_USER, value: "forkwise" }
+        - { name: POSTGRES_PASSWORD, value: "forkwise-secret-pw" }
+        - { name: QDRANT_HOST, value: "qdrant" }
+        - { name: QDRANT_PORT, value: "6333" }
+        - { name: POLL_INTERVAL, value: "5" }
+        resources:
+          requests: { cpu: 500m, memory: 1Gi }
+          limits:   { cpu: "2", memory: 3Gi }
