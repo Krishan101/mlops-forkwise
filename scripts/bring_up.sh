@@ -27,6 +27,7 @@ declare -A SG_PORTS=(
     ["allow-30900"]=30900
     ["allow-30808"]=30808
     ["allow-30500"]=30500
+    ["allow-30300"]=30300
 )
 
 existing_sgs=$(openstack --os-cloud "$OS_CLOUD" security group list -f value -c Name 2>/dev/null || echo "")
@@ -123,6 +124,10 @@ kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
 log "waiting for substitution-api..."
 kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=3m
 
+# --- 9. Monitoring (Prometheus + Grafana) ---
+log "setting up monitoring..."
+bash "$REPO_ROOT/scripts/setup_monitoring.sh"
+
 # --- Summary ---
 log ""
 log "============================================"
@@ -143,6 +148,7 @@ log "--- Platform ---"
 log "Platform DB   : platform-db.forkwise-platform:5432"
 log "Qdrant        : qdrant.forkwise-platform:6333"
 log "MLflow        : http://${NODE1_IP}:30500"
+log "Grafana       : http://${NODE1_IP}:30300  (admin / forkwise-admin)"
 log "Ingest API    : polling mealie every 30s"
 log "Feature Worker: polling feature_jobs every 5s"
 log ""
