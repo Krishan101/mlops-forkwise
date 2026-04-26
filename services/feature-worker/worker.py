@@ -122,41 +122,44 @@ def main():
 
     log.info(f"polling feature_jobs every {POLL_INTERVAL}s")
     while True:
+        conn = None
         try:
             conn = get_pg_conn()
-            with conn:
-                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                    cur.execute("""
-                        SELECT job_id, recipe_id
-                        FROM feature_jobs
-                        WHERE status = 'pending'
-                        ORDER BY created_at
-                        LIMIT 1
-                        FOR UPDATE SKIP LOCKED
-                    """)
-                    row = cur.fetchone()
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("""
+                    SELECT job_id, recipe_id
+                    FROM feature_jobs
+                    WHERE status = 'pending'
+                    ORDER BY created_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                """)
+                row = cur.fetchone()
 
-                    if row is None:
-                        time.sleep(POLL_INTERVAL)
-                        conn.close()
-                        continue
+                if row is None:
+                    conn.close()
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
-                    job_id = row["job_id"]
-                    recipe_id = row["recipe_id"]
+                job_id = row["job_id"]
+                recipe_id = row["recipe_id"]
+                cur.execute(
+                    "UPDATE feature_jobs SET status='processing', started_at=NOW() WHERE job_id=%s",
+                    (job_id,),
+                )
+                conn.commit()
+                log.info(f"processing job {job_id}: recipe {recipe_id}")
+
+                try:
+                    process_job(cur, job_id, recipe_id, model, qdrant)
+                    conn.commit()
+                except Exception as exc:
                     cur.execute(
-                        "UPDATE feature_jobs SET status='processing', started_at=NOW() WHERE job_id=%s",
-                        (job_id,),
+                        "UPDATE feature_jobs SET status='failed', completed_at=NOW(), error=%s WHERE job_id=%s",
+                        (str(exc), job_id),
                     )
-                    log.info(f"processing job {job_id}: recipe {recipe_id}")
-
-                    try:
-                        process_job(cur, job_id, recipe_id, model, qdrant)
-                    except Exception as exc:
-                        cur.execute(
-                            "UPDATE feature_jobs SET status='failed', completed_at=NOW(), error=%s WHERE job_id=%s",
-                            (str(exc), job_id),
-                        )
-                        log.error(f"  [failed] {recipe_id}: {exc}")
+                    conn.commit()
+                    log.error(f"  [failed] {recipe_id}: {exc}")
 
             conn.close()
 
