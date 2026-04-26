@@ -9,3 +9,7 @@ data "openstack_networking_subnet_v2" "sharednet1_subnet" {
 data "openstack_networking_secgroup_v2" "allow_ssh" {
   name = "allow-ssh"
 }
+
+data "openstack_networking_secgroup_v2" "allow_30900" {
+  name = "allow-30900"
+}

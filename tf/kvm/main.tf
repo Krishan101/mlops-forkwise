@@ -31,6 +31,7 @@ resource "openstack_networking_port_v2" "sharednet1_ports" {
   network_id = data.openstack_networking_network_v2.sharednet1.id
   security_group_ids = [
     data.openstack_networking_secgroup_v2.allow_ssh.id,
+    data.openstack_networking_secgroup_v2.allow_30900.id,
   ]
 }
 

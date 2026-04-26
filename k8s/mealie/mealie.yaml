@@ -1,0 +1,125 @@
+# --- Postgres for Mealie ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mealie-db-credentials
+  namespace: forkwise-app
+type: Opaque
+stringData:
+  POSTGRES_USER: mealie
+  POSTGRES_PASSWORD: mealie-secret-pw
+  POSTGRES_DB: mealie
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mealie-db-pvc
+  namespace: forkwise-app
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mealie-db
+  namespace: forkwise-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mealie-db }
+  template:
+    metadata:
+      labels: { app: mealie-db }
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        ports: [{ containerPort: 5432 }]
+        envFrom:
+        - secretRef: { name: mealie-db-credentials }
+        volumeMounts:
+        - name: db-data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: 500m, memory: 512Mi }
+      volumes:
+      - name: db-data
+        persistentVolumeClaim:
+          claimName: mealie-db-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mealie-db
+  namespace: forkwise-app
+spec:
+  selector: { app: mealie-db }
+  ports:
+  - { port: 5432, targetPort: 5432 }
+---
+# --- Mealie App ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mealie-data-pvc
+  namespace: forkwise-app
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mealie
+  namespace: forkwise-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mealie }
+  template:
+    metadata:
+      labels: { app: mealie }
+    spec:
+      containers:
+      - name: mealie
+        image: ghcr.io/mealie-recipes/mealie:v3.16.0
+        ports: [{ containerPort: 9000 }]
+        env:
+        - { name: ALLOW_SIGNUP, value: "true" }
+        - { name: DB_ENGINE, value: "postgres" }
+        - { name: POSTGRES_USER, valueFrom: { secretKeyRef: { name: mealie-db-credentials, key: POSTGRES_USER } } }
+        - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: mealie-db-credentials, key: POSTGRES_PASSWORD } } }
+        - { name: POSTGRES_DB, valueFrom: { secretKeyRef: { name: mealie-db-credentials, key: POSTGRES_DB } } }
+        - { name: POSTGRES_SERVER, value: "mealie-db" }
+        - { name: POSTGRES_PORT, value: "5432" }
+        - { name: MAX_WORKERS, value: "1" }
+        - { name: WEB_CONCURRENCY, value: "1" }
+        - { name: TZ, value: "America/New_York" }
+        volumeMounts:
+        - name: app-data
+          mountPath: /app/data
+        resources:
+          requests: { cpu: 200m, memory: 512Mi }
+          limits:   { cpu: "1", memory: 1Gi }
+      volumes:
+      - name: app-data
+        persistentVolumeClaim:
+          claimName: mealie-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mealie
+  namespace: forkwise-app
+spec:
+  type: NodePort
+  selector: { app: mealie }
+  ports:
+  - { port: 9000, targetPort: 9000, nodePort: 30900 }
