@@ -1,274 +1,310 @@
-# Pixels to Predictions: DL Vision Challenge
+# ForkWise MLOps Infrastructure
 
-## Competition Overview
-Fine-tune **SmolVLM-500M-Instruct** to answer science multiple-choice questions from images + text.  
-Metric: **Accuracy** on hidden test set.  
-**TA Baseline Score: 0.67806**  
-**Submission: 1,008 predictions** (`id, answer`)
+ML-powered ingredient substitution system built on top of [Mealie](https://github.com/HivanshD/mealie), a self-hosted recipe manager. Users browse recipes in Mealie and get smart substitution suggestions for any ingredient — powered by sentence-transformer embeddings and a vector similarity search pipeline.
 
----
+## Architecture
 
-## Hard Constraints
-| Constraint | Detail |
-|---|---|
-| Model | `HuggingFaceTB/SmolVLM-500M-Instruct` only |
-| Max trainable params | **5 million** |
-| Compute | Google Colab Free / Student tier + Kaggle Free tier |
-| Data | Competition data only — no external datasets |
-| Internet at eval | **None** — offline inference on Kaggle |
-| Team size | Max 2 |
-| Submission | `submission.csv` with columns `id, answer` (0-indexed int) |
-| Libraries (from starter) | `transformers==4.57.6, peft==0.18.1, bitsandbytes, accelerate, datasets, pillow` |
+```
+User → Mealie (recipe app, port 30900)
+         ↓ (polls every 30s)
+       Ingest Service → Platform Postgres + Feature Job Queue
+                           ↓
+                        Feature Worker → Sentence-Transformer Embeddings → Qdrant
+                           ↓
+User clicks "Suggest Substitute" → Mealie → Substitution API → Qdrant search → ranked results
+                           ↓
+                     Accept/Reject feedback → Postgres (for retraining)
 
----
-
-## Dataset Summary (Confirmed)
-
-### Split Sizes
-| Split | Count |
-|---|---|
-| Train | **3,109** |
-| Val | **1,048** |
-| Test | **1,008** |
-
-> Image-only subset of ScienceQA. Every question has an associated image.
-
-### Number of Choices Distribution
-| num_choices | Train | Val | Test |
-|---|---|---|---|
-| 2 | 664 (21%) | 244 (23%) | 272 (27%) |
-| 3 | 1,552 (50%) | 508 (48%) | 438 (43%) |
-| 4 | 783 (25%) | 252 (24%) | 260 (26%) |
-| 5 | 110 (4%) | 44 (4%) | 38 (4%) |
-
-> Random baseline: ~33% (weighted avg). Majority are 3-choice questions.
-
-### Subject Distribution (Train)
-| Subject | Count | % |
-|---|---|---|
-| natural science | 2,264 | **73%** |
-| social science | 768 | 25% |
-| language science | 77 | 2% |
-
-### Grade Distribution (Train)
-| Grade | Count |
-|---|---|
-| grade1 | 5 |
-| grade2 | 115 |
-| grade3 | 289 |
-| grade4 | 484 |
-| grade5 | 354 |
-| grade6 | 611 |
-| grade7 | 545 |
-| grade8 | 685 |
-| grade12 | 21 |
-
-> Bulk is grades 3–8. Very few grade1/grade12.
-
-### Context Availability (Train)
-| Field | Available | Total | % |
-|---|---|---|---|
-| hint | 2,385 | 3,109 | **77%** |
-| lecture | 2,669 | 3,109 | **86%** |
-| both | 2,128 | 3,109 | 68% |
-
-> Most questions have rich context — model can lean on lecture+hint heavily.
-
-### Answer Distribution (Train)
-| Answer Index | Count |
-|---|---|
-| 0 | 1,124 (36%) |
-| 1 | 1,028 (33%) |
-| 2 | 737 (24%) |
-| 3 | 204 (7%) |
-| 4 | 16 (0.5%) |
-
-### Category/Topic Richness
-- **55** unique categories, **14** unique topics, **109** unique skills
-- Top: Designing experiments (222), Solutions (222), Ecosystems (195), Maps (190)
-
-### Image Characteristics (sample of 50)
-- Mean: ~262×241 px, Min: 202×202, Max: 760×327
-- Starter notebook resizes to 224×224 — fine for SmolVLM
-
-### Test Set
-- **No `answer` column** — that's what we predict
-- `sample_submission.csv` has 1,008 rows with columns `id, answer`
-
----
-
-## Starter Notebook Analysis
-
-### What it provides:
-1. **Data loading:** CSVs → DataFrames, parses `choices` JSON, PyTorch Dataset class
-2. **Prompt format:**
-   ```
-   <image>
-   Context:
-   {lecture}
-   {hint}
-
-   Question: {question}
-   Choices:
-     A. {choice_0}
-     B. {choice_1}
-     ...
-   Answer:
-   ```
-   - `<image>` token required for vision input
-   - For training: appends correct letter (e.g., `Answer: A`)
-3. **Model loading:** `AutoProcessor` + `AutoModelForVision2Seq`
-4. **Inference:** Greedy generation (`max_new_tokens=20, do_sample=False`)
-5. **Image handling:** Resize to 224×224 with BICUBIC
-
-### What it does NOT do (gaps we fill):
-- No fine-tuning / QLoRA implementation
-- No log-likelihood scoring (only unreliable greedy generation)
-- No batch inference
-- No evaluation loop
-- No submission generation
-- No checkpointing
-
-### Key observation from starter output:
-- Base model greedy generation repeats the prompt and gives contradictory answers
-- Confirms we **must use log-likelihood scoring**, not text generation
-
----
-
-## Execution Plan (Step by Step)
-
-### PHASE 0 — Zero-Shot + Prompt Engineering (no training)
-| Step | What | Why |
-|---|---|---|
-| 0.1 | Mount Drive, setup folders, install packages | Infrastructure |
-| 0.2 | Load data + base SmolVLM model | Setup |
-| 0.3 | Implement log-likelihood scoring function | Score each choice letter's probability instead of generating text |
-| 0.4 | Run zero-shot inference on val set (batch=16-20) | Establish baseline accuracy |
-| 0.5 | Try 2-3 prompt variants, compare val accuracy | Find best prompt template |
-| 0.6 | Save results to `checkpoints/phase0_zero_shot_results.json` | Checkpoint |
-| **Expected output** | Val accuracy ~35-50%, best prompt template identified | |
-
-### PHASE 1 — Baseline QLoRA Training (~300K params)
-| Step | What | Why |
-|---|---|---|
-| 1.1 | Setup QLoRA: 4-bit NF4, LoRA rank 8-16 on attention layers | Stay under 5M param cap |
-| 1.2 | Train on 200 samples, 1 epoch — verify loss decreases | Sanity check before scaling |
-| 1.3 | Train on 10% data (~310 samples), 1 epoch — check val accuracy | Quick iteration |
-| 1.4 | Train on full data (3,109 samples), 1 epoch | Full baseline |
-| 1.5 | Evaluate on val set, save checkpoint | Track progress |
-| **Expected output** | Val accuracy ~55-65%, saved LoRA adapter | |
-
-### PHASE 2 — Iterate & Beat TA Baseline (0.678)
-| Step | What | Why |
-|---|---|---|
-| 2.1 | Error analysis: per-category/grade/subject accuracy on val | Find weak spots |
-| 2.2 | Hard sample mining: collect misclassified val examples | Focus training effort |
-| 2.3 | Hyperparameter sweeps: LoRA rank, LR, epochs, target layers | Optimize |
-| 2.4 | Scale params toward 5M cap if needed | Use full budget |
-| 2.5 | Re-evaluate on val, checkpoint best model | Track improvements |
-| **Expected output** | Val accuracy >0.678, best LoRA adapter saved | |
-
-### PHASE 3 — Inference Optimization + Test Submission
-| Step | What | Why |
-|---|---|---|
-| 3.1 | Optimize inference: batch=16-20, CPU preprocess, GPU forward | Speed: 1000 samples in ~5 min |
-| 3.2 | Run inference on full test set (1,008 samples) | Generate predictions |
-| 3.3 | Create `submission.csv`, verify format against `sample_submission.csv` | Match Kaggle requirements |
-| 3.4 | Upload to Kaggle, check public leaderboard score | Submit |
-| **Expected output** | `submission.csv` with 1,008 predictions | |
-
-### PHASE 4 — Kaggle Notebook for Offline Evaluation
-| Step | What | Why |
-|---|---|---|
-| 4.1 | Create Kaggle notebook that loads saved LoRA adapter | Offline = no internet |
-| 4.2 | Pre-upload model weights + adapter as Kaggle dataset | Can't download at eval time |
-| 4.3 | Test end-to-end in Kaggle environment | Verify it works offline |
-| **Expected output** | Working Kaggle submission notebook | |
-
----
-
-## Log-Likelihood Scoring (Key Method)
-
-Instead of generating text (slow + unreliable), we score each answer choice:
-
-```python
-# Pseudocode — ONE forward pass per question
-prompt = "...\nAnswer:"           # ends before the letter
-logits = model(prompt + image)    # shape: [seq_len, vocab_size]
-last_logits = logits[:, -1, :]    # logits at the "Answer:" position
-
-# Get log-probs for each choice letter token
-for i, letter in enumerate(["A", "B", "C", ...]):
-    token_id = tokenizer.encode(letter)[0]
-    log_probs[i] = log_softmax(last_logits)[token_id]
-
-prediction = argmax(log_probs)    # 0-indexed answer
+MLflow (port 30500) — experiment tracking
+Grafana (port 30300) — cluster monitoring (Prometheus)
 ```
 
-Benefits:
-- **One forward pass per question** (not per choice)
-- **No parsing** of messy generated text
-- **Batchable** — process 16-20 questions at once
+## Infrastructure
 
----
+- **Cloud:** Chameleon Cloud, KVM@TACC site
+- **VMs:** 3x `m1.xlarge` on Ubuntu 24.04 (1 control plane + 2 workers)
+- **Networking:** dual-NIC — `sharednet1` (public) + private `192.168.1.0/24`
+- **K8s:** kubespray (release-2.26), single control plane on node1
+- **Storage:** local-path-provisioner for PVCs
+- **Object Store:** `s3://data-proj01` on Chameleon (backups + ML training data)
 
-## Checkpointing Strategy
-All saved to Google Drive: `kaggle_final_competition/checkpoints/`
+## Credentials
 
-| Checkpoint | Content |
-|---|---|
-| `phase0_zero_shot_results.json` | Zero-shot val accuracy per prompt variant |
-| `phase1_lora_300k_epoch1.pt` | First LoRA training run |
-| `phase1_val_results.json` | Val accuracy after phase 1 |
-| `phase2_lora_best.pt` | Best model from iteration |
-| `phase2_error_analysis.json` | Per-category accuracy breakdown |
-| `submission.csv` | Final test predictions |
+**Chameleon OpenStack (KVM@TACC):**
+- Auth URL: `https://kvm.tacc.chameleoncloud.org:5000`
+- SSH key on Chameleon: `forkwise-key`
+- SSH key on local machine: `C:\Users\Krishan Guta\.ssh\forkwise_key`
+- Project prefix: `proj01`
 
----
+**Object Store (CHI@TACC):**
+- Endpoint: `https://chi.tacc.chameleoncloud.org:7480`
+- Access Key: `8921c48faf83433db2b1439a9b2889fd`
+- Secret Key: `7d1ce78efc5a48019888c9f3fa8ba2dd`
+- Buckets: `data-proj01` (training data + backups), `models-proj01` (model checkpoints)
 
-## File Structure
+**Mealie:**
+- Email: `krishankumargupta101@gmail.com`
+- Password: `mynameiskrishan`
+
+**Grafana:**
+- User: `admin`
+- Password: `forkwise-admin`
+
+**GHCR (GitHub Container Registry):**
+- User: `Krishan101`
+- All images are public under `ghcr.io/krishan101/`
+
+## Docker Images
+
+| Service | Image | Built From |
+|---------|-------|------------|
+| Mealie (fork) | `ghcr.io/krishan101/forkwise-mealie:0.1.0` | `github.com/HivanshD/mealie` |
+| Ingest API | `ghcr.io/krishan101/forkwise-ingest:0.1.0` | `services/ingest-api/` |
+| Feature Worker | `ghcr.io/krishan101/forkwise-feature-worker:0.1.3` | `services/feature-worker/` |
+| Substitution API | `ghcr.io/krishan101/forkwise-substitution-api:0.1.3` | `services/substitution-api/` |
+| MLflow | `ghcr.io/krishan101/forkwise-mlflow:0.1.0` | `services/mlflow/` |
+
+## Repository Structure
+
 ```
-kaggle_final_competition/           # Google Drive root
-├── README.md
-├── data/                           # Competition data
-│   ├── train.csv
-│   ├── val.csv
-│   ├── test.csv
-│   ├── sample_submission.csv
-│   └── images/
-│       ├── train/
-│       ├── val/
-│       └── test/
-├── checkpoints/                    # Model checkpoints & results
-├── notebooks/                      # Development notebooks
-│   └── main.ipynb
-└── submissions/                    # Generated submissions
-    └── submission.csv
+mlops-forkwise/
+├── provision/
+│   └── provision.ipynb          # Jupyter notebook — run on Chameleon JupyterHub
+├── tf/kvm/                      # Terraform configs for 3 VMs + network + floating IP
+├── db/
+│   └── init.sql                 # Platform postgres schema (recipe metadata, feedback, jobs)
+├── k8s/
+│   ├── mealie/                  # Mealie app + its postgres
+│   ├── platform/                # Platform services (ingest, feature-worker, substitution, mlflow, qdrant, postgres)
+│   └── monitoring/              # Prometheus + Grafana namespace
+├── services/
+│   ├── ingest-api/              # Polls Mealie for recipes, stores in platform DB
+│   ├── feature-worker/          # Computes sentence-transformer embeddings → Qdrant
+│   ├── substitution-api/        # Searches Qdrant for ingredient substitutes
+│   └── mlflow/                  # MLflow with psycopg2 + boto3
+├── scripts/
+│   ├── bring_up.sh              # Deploys everything, restores from S3 if backups exist
+│   ├── backup.sh                # Snapshots all state to S3
+│   ├── teardown.sh              # Backs up then deletes all K8s resources
+│   ├── setup_monitoring.sh      # Installs kube-prometheus-stack via Helm
+│   └── _s3_common.sh            # Shared S3 helpers
+└── clouds.yaml.example          # Template for OpenStack credentials
 ```
 
----
+## Full Setup From Scratch
 
-## Key Risks & Mitigations
-| Risk | Mitigation |
-|---|---|
-| Colab disconnects mid-training | Checkpoint every N steps + resume logic |
-| 5M param cap too restrictive | LoRA is efficient; 300K–2M should suffice |
-| Kaggle offline = can't download model | Pre-save model weights as Kaggle dataset |
-| Test distribution shift | Val distribution looks similar to test (confirmed) |
-| Greedy generation unreliable | Log-likelihood scoring instead |
-| Colab compute limits | Start small (200 samples), scale up gradually |
+### Step 1: Provision VMs (Chameleon JupyterHub)
 
----
+1. Go to [Chameleon JupyterHub](https://jupyter.chameleoncloud.org/)
+2. Place `clouds.yaml` at `/work/clouds.yaml` with your KVM@TACC application credentials
+3. Upload `provision/provision.ipynb` or clone the repo at `/work/`
+4. Run all cells top to bottom — this creates a 24-hour lease, installs Terraform, and provisions 3 VMs with a floating IP
 
-## TA Hints Summary
-1. Start with zero-shot inference, then prompt engineer
-2. Baseline: 1 epoch, ~300K params, costs 2–3 CUs
-3. Don't train on full data while experimenting — use 10% or 100–200 samples
-4. Sample and validate on hard examples
-5. Try different inference techniques
-6. Async preprocessing on CPU, batch 16–20 on GPU → 30x speedup
-7. 1000 samples inference should take ~5 min if done right
+### Step 2: Copy SSH Key to node1 (from Windows PowerShell)
 
----
+```powershell
+scp -i "C:\Users\Krishan Guta\.ssh\forkwise_key" "C:\Users\Krishan Guta\.ssh\forkwise_key" cc@<FLOATING_IP>:~/.ssh/forkwise-key
+```
 
-*Last updated: 2026-04-24 — Brainstorming complete. Ready for Phase 0.*
+### Step 3: Copy clouds.yaml to node1 (from Windows PowerShell)
+
+```powershell
+ssh -i "C:\Users\Krishan Guta\.ssh\forkwise_key" cc@<FLOATING_IP> "mkdir -p ~/.config/openstack"
+scp -i "C:\Users\Krishan Guta\.ssh\forkwise_key" "C:\Users\Krishan Guta\path\to\clouds.yaml" cc@<FLOATING_IP>:~/.config/openstack/clouds.yaml
+```
+
+### Step 4: SSH into node1
+
+```powershell
+ssh -i "C:\Users\Krishan Guta\.ssh\forkwise_key" cc@<FLOATING_IP>
+```
+
+### Step 5: Set up SSH keys on node1
+
+```bash
+chmod 600 ~/.ssh/*
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -q -N ""
+cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+cat ~/.ssh/id_rsa.pub | ssh -i ~/.ssh/forkwise-key -o StrictHostKeyChecking=no cc@192.168.1.12 "cat >> ~/.ssh/authorized_keys"
+cat ~/.ssh/id_rsa.pub | ssh -i ~/.ssh/forkwise-key -o StrictHostKeyChecking=no cc@192.168.1.13 "cat >> ~/.ssh/authorized_keys"
+```
+
+### Step 6: Disable IPv6 on all nodes
+
+```bash
+for ip in 192.168.1.11 192.168.1.12 192.168.1.13; do ssh -o StrictHostKeyChecking=no cc@$ip 'sudo sysctl -w net.ipv6.conf.ens3.disable_ipv6=1'; done
+```
+
+### Step 7: Install kubespray and deploy K8s
+
+```bash
+sudo apt update && sudo apt install -y python3-pip python3-venv git tmux
+git clone -b release-2.26 https://github.com/kubernetes-sigs/kubespray.git
+cd kubespray
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt ruamel.yaml
+```
+
+Build inventory:
+
+```bash
+cp -rfp inventory/sample inventory/mycluster
+CONFIG_FILE=inventory/mycluster/hosts.yaml python3 contrib/inventory_builder/inventory.py 192.168.1.11 192.168.1.12 192.168.1.13
+python3 -c "import yaml; p='inventory/mycluster/hosts.yaml'; d=yaml.safe_load(open(p)); d['all']['children']['kube_control_plane']['hosts']={'node1': None}; open(p,'w').write(yaml.safe_dump(d, default_flow_style=False))"
+```
+
+Configure ansible:
+
+```bash
+cat > inventory/mycluster/group_vars/all/all.yml << 'EOF'
+ansible_user: cc
+ansible_ssh_private_key_file: /home/cc/.ssh/forkwise-key
+ansible_become: true
+ansible_become_method: sudo
+disable_ipv6_dns: true
+EOF
+
+sed -i 's/^helm_enabled: false/helm_enabled: true/' inventory/mycluster/group_vars/k8s_cluster/addons.yml
+```
+
+Test and run (in tmux):
+
+```bash
+ansible -i inventory/mycluster/hosts.yaml all -m ping
+tmux new -s kubespray
+cd ~/kubespray && source .venv/bin/activate
+ansible-playbook -i inventory/mycluster/hosts.yaml cluster.yml -b 2>&1 | tee /tmp/kubespray.log
+# Detach: Ctrl+B then D   Reattach: tmux attach -t kubespray
+```
+
+### Step 8: Post-kubespray setup
+
+```bash
+mkdir -p ~/.kube && sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type='json' -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system get configmap coredns -o yaml | sed 's|forward . /etc/resolv.conf|forward . 8.8.8.8 1.1.1.1|' | kubectl apply -f -
+kubectl -n kube-system rollout restart deployment coredns
+```
+
+Verify:
+
+```bash
+kubectl get nodes
+kubectl get pods -A
+```
+
+### Step 9: Clone repo and deploy everything
+
+```bash
+cd ~
+git clone https://github.com/Krishan101/mlops-forkwise.git
+cd mlops-forkwise
+bash scripts/bring_up.sh
+```
+
+This single command:
+- Disables IPv6 (Chameleon fix)
+- Creates and attaches security groups for all NodePorts
+- Deploys all K8s resources in order
+- Checks S3 for backups and restores if found (mealie-db, platform-db, qdrant, mealie-data)
+- Fixes the Mealie ingredient reference_id bug
+- Installs Prometheus + Grafana monitoring
+
+### Step 10: Verify
+
+After `bring_up.sh` completes, all services are accessible:
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| Mealie | `http://<FLOATING_IP>:30900` | Create account on first visit |
+| Substitution API | `http://<FLOATING_IP>:30808/health` | — |
+| MLflow | `http://<FLOATING_IP>:30500` | — |
+| Grafana | `http://<FLOATING_IP>:30300` | admin / forkwise-admin |
+
+Test substitution from node1:
+
+```bash
+curl -s -X POST http://substitution-api.forkwise-platform:8080/substitute -H "Content-Type: application/json" -d '{"ingredient":"butter","recipe_name":"Classic Pancakes","top_k":5}' | python3 -m json.tool
+```
+
+## Building Docker Images
+
+If you need to rebuild any service image (after code changes), run on node1:
+
+```bash
+# Fix IPv6 first (required for pip/HuggingFace downloads during build)
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+
+# Clean disk space if needed
+docker system prune -a -f
+
+# Login to GHCR
+echo "<GHCR_TOKEN>" | docker login ghcr.io -u Krishan101 --password-stdin
+
+# Build and push (example: substitution-api)
+cd ~/mlops-forkwise/services/substitution-api
+docker build --no-cache -t ghcr.io/krishan101/forkwise-substitution-api:0.1.4 .
+docker push ghcr.io/krishan101/forkwise-substitution-api:0.1.4
+
+# Make package public: github.com → Packages → Package settings → Change visibility → Public
+
+# Update the running deployment
+kubectl -n forkwise-platform set image deployment/substitution-api substitution-api=ghcr.io/krishan101/forkwise-substitution-api:0.1.4
+```
+
+For the Mealie fork image:
+
+```bash
+cd ~
+git clone https://github.com/HivanshD/mealie.git mealie-fork
+cd mealie-fork
+docker build -f docker/Dockerfile -t ghcr.io/krishan101/forkwise-mealie:0.1.1 .
+docker push ghcr.io/krishan101/forkwise-mealie:0.1.1
+kubectl -n forkwise-app set image deployment/mealie mealie=ghcr.io/krishan101/forkwise-mealie:0.1.1
+```
+
+## Backup & Restore
+
+**Backup** (run before teardown or anytime):
+
+```bash
+bash scripts/backup.sh
+```
+
+Snapshots to `s3://data-proj01/backups/`:
+- `mealie-db/latest.sql.gz` — Mealie postgres dump
+- `platform-db/latest.sql.gz` — Platform postgres dump (all DBs)
+- `qdrant/latest.snapshot` — Qdrant vector snapshot
+- `mealie-data/latest.tar.gz` — Mealie PVC data (uploads, config)
+
+**Restore** happens automatically during `bring_up.sh` — if backups exist in S3, they are restored after each service deploys.
+
+## Teardown
+
+```bash
+bash scripts/teardown.sh
+```
+
+This backs up everything to S3, then deletes all K8s namespaces. After teardown, destroy VMs from the provision notebook's teardown cells.
+
+## Data Pipeline Flow
+
+1. **User adds recipe in Mealie** (via UI or API)
+2. **Ingest service** polls Mealie every 30s, detects new recipes, stores metadata + ingredients in platform postgres, queues a feature job
+3. **Feature worker** picks up the job, computes a 384-dim sentence-transformer embedding for each ingredient (contextualized by recipe name), upserts into Qdrant
+4. **User clicks "Suggest Substitute"** on any ingredient in Mealie's recipe page
+5. **Mealie backend** calls the Substitution API's `/predict` endpoint
+6. **Substitution API** embeds the query, searches Qdrant for similar ingredients from other recipes, returns ranked suggestions, logs the query to postgres
+7. **User clicks Accept/Reject** — feedback is logged to postgres via the `/feedback` endpoint for future retraining
+
+## Known Issues
+
+- **Mealie `reference_id` bug:** The Mealie fork generates a new UUID for each ingredient on every recipe load instead of persisting it. `bring_up.sh` works around this with a SQL UPDATE. New recipes added after deployment may need the fix re-run: `kubectl -n forkwise-app exec deploy/mealie-db -- psql -U mealie -d mealie -c "UPDATE recipes_ingredients SET reference_id = gen_random_uuid() WHERE reference_id IS NULL"`
+- **IPv6 on Chameleon:** IPv6 doesn't route on Chameleon KVM@TACC. Must disable it for Docker builds, pip installs, and HuggingFace model downloads. `bring_up.sh` handles this automatically. For manual Docker builds, run `sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1` first (keep loopback enabled for kubectl: `sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0`).
+- **Disk space:** The node1 VM has 37GB disk. Docker images (especially Mealie and the sentence-transformer services) are large. Run `docker system prune -a -f` before building if disk is low.
+- **Security groups:** Chameleon's shared project may have duplicate security group names. `bring_up.sh` creates and attaches by name; if duplicates exist, manual attachment by ID may be needed.
