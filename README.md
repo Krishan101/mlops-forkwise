@@ -1,22 +1,46 @@
 # ForkWise MLOps Infrastructure
 
-ML-powered ingredient substitution system built on top of [Mealie](https://github.com/HivanshD/mealie), a self-hosted recipe manager. Users browse recipes in Mealie and get smart substitution suggestions for any ingredient — powered by sentence-transformer embeddings and a vector similarity search pipeline.
+ML-powered ingredient substitution system built on top of [Mealie](https://github.com/HivanshD/mealie), a self-hosted recipe manager. Users browse recipes in Mealie and get smart substitution suggestions for any ingredient — powered by **GISMo** (Graph-based Ingredient Substitution Module), a GNN model trained on FlavorGraph and Recipe1MSubs, with continuous improvement from user feedback.
+
+Based on the paper: *"Learning to Substitute Ingredients in Recipes"* (Fatemi et al., 2023, arXiv:2302.07960).
 
 ## Architecture
 
 ```
-User → Mealie (recipe app, port 30900)
-         ↓ (polls every 30s)
-       Ingest Service → Platform Postgres + Feature Job Queue
-                           ↓
-                        Feature Worker → Sentence-Transformer Embeddings → Qdrant
-                           ↓
-User clicks "Suggest Substitute" → Mealie → Substitution API → Qdrant search → ranked results
-                           ↓
-                     Accept/Reject feedback → Postgres (for retraining)
+                        ┌─────────────────────────────────────┐
+                        │         Mealie (port 30900)         │
+                        │    Recipe app with substitution UI  │
+                        └──────┬──────────────┬───────────────┘
+                               │              │
+                    polls every 30s    "Suggest Substitute"
+                               │              │
+                               ▼              ▼
+                        ┌────────────┐  ┌─────────────────────┐
+                        │ Ingest API │  │  Substitution API   │
+                        └─────┬──────┘  │  /predict /feedback │
+                              │         └────┬───────────┬────┘
+                              ▼              │           │
+                     ┌─────────────┐    Qdrant search   logs to
+                     │ Platform DB │         │        PostgreSQL
+                     │ (Postgres)  │◄────────┘           │
+                     └─────┬───────┘                     │
+                           │                             ▼
+                    feature jobs              ┌──────────────────┐
+                           │                  │ Feedback Trainer  │
+                           ▼                  │ POST /train       │
+                    ┌──────────────┐          │ GISMo retraining  │
+                    │Feature Worker│          └────────┬──────────┘
+                    │  SBERT embed │                   │
+                    └──────┬───────┘          trains GISMo (GNN)
+                           │                  logs to MLflow
+                           ▼                  updates Qdrant
+                    ┌──────────────┐                   │
+                    │    Qdrant    │◄──────────────────┘
+                    │ Vector DB   │
+                    └─────────────┘
 
 MLflow (port 30500) — experiment tracking
-Grafana (port 30300) — cluster monitoring (Prometheus)
+Grafana (port 30300) — cluster monitoring (Prometheus + kube-prometheus-stack)
 ```
 
 ## Infrastructure
@@ -27,6 +51,21 @@ Grafana (port 30300) — cluster monitoring (Prometheus)
 - **K8s:** kubespray (release-2.26), single control plane on node1
 - **Storage:** local-path-provisioner for PVCs
 - **Object Store:** `s3://data-proj01` on Chameleon (backups + ML training data)
+- **Monitoring:** Prometheus + Grafana via kube-prometheus-stack Helm chart
+
+## ML Model: GISMo
+
+GISMo uses Graph Isomorphism Network (GIN) layers over FlavorGraph (6,653 ingredient nodes + flavor molecule edges) to learn context-aware ingredient embeddings. Given a recipe context and a source ingredient, it scores all candidate ingredients as potential substitutions using a learned MLP decoder trained with contrastive loss.
+
+**Training data:**
+- FlavorGraph — ingredient co-occurrence graph from Recipe1M
+- Recipe1MSubs — 49K/10K/10K train/val/test substitution pairs extracted from user comments
+- User feedback — Accept/Reject signals from Mealie UI (continuous improvement)
+
+**Metrics tracked in MLflow:**
+- MRR (Mean Reciprocal Rank), Hit@1, Hit@3, Hit@10
+- Training loss per epoch, inference latency (avg/p50/p95/p99)
+- Model weights, vocabulary, embeddings as artifacts
 
 ## Credentials
 
@@ -63,32 +102,50 @@ Grafana (port 30300) — cluster monitoring (Prometheus)
 | Feature Worker | `ghcr.io/krishan101/forkwise-feature-worker:0.1.3` | `services/feature-worker/` |
 | Substitution API | `ghcr.io/krishan101/forkwise-substitution-api:0.1.3` | `services/substitution-api/` |
 | MLflow | `ghcr.io/krishan101/forkwise-mlflow:0.1.0` | `services/mlflow/` |
+| Feedback Trainer | `ghcr.io/krishan101/forkwise-feedback-trainer:0.1.0` | `services/retraining-loop/` |
+| GISMo Train (Job) | `ghcr.io/krishan101/forkwise-gismo-train:0.1.0` | `services/retraining-loop/Dockerfile.train` |
 
 ## Repository Structure
 
 ```
 mlops-forkwise/
 ├── provision/
-│   └── provision.ipynb          # Jupyter notebook — run on Chameleon JupyterHub
-├── tf/kvm/                      # Terraform configs for 3 VMs + network + floating IP
+│   └── provision.ipynb              # Jupyter notebook — run on Chameleon JupyterHub
+├── tf/kvm/                          # Terraform configs for 3 VMs + network + floating IP
 ├── db/
-│   └── init.sql                 # Platform postgres schema (recipe metadata, feedback, jobs)
+│   └── init.sql                     # Platform postgres schema
 ├── k8s/
-│   ├── mealie/                  # Mealie app + its postgres
-│   ├── platform/                # Platform services (ingest, feature-worker, substitution, mlflow, qdrant, postgres)
-│   └── monitoring/              # Prometheus + Grafana namespace
+│   ├── mealie/                      # Mealie app + its postgres
+│   ├── platform/                    # Platform services (all in forkwise-platform namespace)
+│   │   ├── postgres.yaml            # Platform DB (recipe metadata, feedback, jobs, mlflow DB)
+│   │   ├── qdrant.yaml              # Qdrant vector DB
+│   │   ├── ingest-api.yaml          # Polls Mealie → postgres + feature jobs
+│   │   ├── feature-worker.yaml      # Computes SBERT embeddings → Qdrant
+│   │   ├── substitution-api.yaml    # /predict + /feedback + /substitute endpoints
+│   │   ├── mlflow.yaml              # MLflow tracking server
+│   │   └── feedback-trainer.yaml    # GISMo retraining API
+│   └── monitoring/                  # Prometheus + Grafana namespace
 ├── services/
-│   ├── ingest-api/              # Polls Mealie for recipes, stores in platform DB
-│   ├── feature-worker/          # Computes sentence-transformer embeddings → Qdrant
-│   ├── substitution-api/        # Searches Qdrant for ingredient substitutes
-│   └── mlflow/                  # MLflow with psycopg2 + boto3
+│   ├── ingest-api/                  # Polls Mealie for recipes
+│   ├── feature-worker/              # SBERT embeddings → Qdrant
+│   ├── substitution-api/            # Searches Qdrant for substitutes
+│   ├── mlflow/                      # MLflow with psycopg2 + boto3
+│   └── retraining-loop/             # GISMo model + training + feedback API
+│       ├── gismo_model.py           # GISMo: GIN + Context Encoder + MLP Decoder
+│       ├── data_loader.py           # Loads FlavorGraph, Recipe1MSubs, feedback
+│       ├── train.py                 # Standalone training (MLflow logging)
+│       ├── feedback_train.py        # FastAPI retraining server
+│       ├── config.yaml              # Training hyperparameters
+│       ├── GUIDE.md                 # Detailed retraining guide
+│       ├── Dockerfile               # Feedback trainer image
+│       └── Dockerfile.train         # Standalone training image
 ├── scripts/
-│   ├── bring_up.sh              # Deploys everything, restores from S3 if backups exist
-│   ├── backup.sh                # Snapshots all state to S3
-│   ├── teardown.sh              # Backs up then deletes all K8s resources
-│   ├── setup_monitoring.sh      # Installs kube-prometheus-stack via Helm
-│   └── _s3_common.sh            # Shared S3 helpers
-└── clouds.yaml.example          # Template for OpenStack credentials
+│   ├── bring_up.sh                  # Deploys everything + S3 restore
+│   ├── backup.sh                    # Snapshots all state to S3
+│   ├── teardown.sh                  # Backs up then deletes K8s resources
+│   ├── setup_monitoring.sh          # Installs kube-prometheus-stack
+│   └── _s3_common.sh               # Shared S3 helpers
+└── clouds.yaml.example             # Template for OpenStack credentials
 ```
 
 ## Full Setup From Scratch
@@ -96,30 +153,27 @@ mlops-forkwise/
 ### Step 1: Provision VMs (Chameleon JupyterHub)
 
 1. Go to [Chameleon JupyterHub](https://jupyter.chameleoncloud.org/)
-2. Place `clouds.yaml` at `/work/clouds.yaml` with your KVM@TACC application credentials
-3. Upload `provision/provision.ipynb` or clone the repo at `/work/`
-4. Run all cells top to bottom — this creates a 24-hour lease, installs Terraform, and provisions 3 VMs with a floating IP
+2. Clone the repo: `cd /work && git clone https://github.com/Krishan101/mlops-forkwise.git`
+3. Place `clouds.yaml` at `/work/clouds.yaml` with your KVM@TACC application credentials
+4. Open `provision/provision.ipynb` and run all cells top to bottom
 
-### Step 2: Copy SSH Key to node1 (from Windows PowerShell)
+**Note:** If Terraform fails with "More than one Security Group found", hardcode SG IDs in `data.tf` and `main.tf` (see Known Issues).
+
+### Step 2: Copy SSH Key and clouds.yaml to node1 (from Windows PowerShell)
 
 ```powershell
 scp -i "C:\Users\Krishan Guta\.ssh\forkwise_key" "C:\Users\Krishan Guta\.ssh\forkwise_key" cc@<FLOATING_IP>:~/.ssh/forkwise-key
-```
-
-### Step 3: Copy clouds.yaml to node1 (from Windows PowerShell)
-
-```powershell
 ssh -i "C:\Users\Krishan Guta\.ssh\forkwise_key" cc@<FLOATING_IP> "mkdir -p ~/.config/openstack"
 scp -i "C:\Users\Krishan Guta\.ssh\forkwise_key" "C:\Users\Krishan Guta\path\to\clouds.yaml" cc@<FLOATING_IP>:~/.config/openstack/clouds.yaml
 ```
 
-### Step 4: SSH into node1
+### Step 3: SSH into node1
 
 ```powershell
 ssh -i "C:\Users\Krishan Guta\.ssh\forkwise_key" cc@<FLOATING_IP>
 ```
 
-### Step 5: Set up SSH keys on node1
+### Step 4: Set up SSH keys on node1
 
 ```bash
 chmod 600 ~/.ssh/*
@@ -129,13 +183,13 @@ cat ~/.ssh/id_rsa.pub | ssh -i ~/.ssh/forkwise-key -o StrictHostKeyChecking=no c
 cat ~/.ssh/id_rsa.pub | ssh -i ~/.ssh/forkwise-key -o StrictHostKeyChecking=no cc@192.168.1.13 "cat >> ~/.ssh/authorized_keys"
 ```
 
-### Step 6: Disable IPv6 on all nodes
+### Step 5: Disable IPv6 on all nodes
 
 ```bash
 for ip in 192.168.1.11 192.168.1.12 192.168.1.13; do ssh -o StrictHostKeyChecking=no cc@$ip 'sudo sysctl -w net.ipv6.conf.ens3.disable_ipv6=1'; done
 ```
 
-### Step 7: Install kubespray and deploy K8s
+### Step 6: Install kubespray and deploy K8s
 
 ```bash
 sudo apt update && sudo apt install -y python3-pip python3-venv git tmux
@@ -177,7 +231,7 @@ ansible-playbook -i inventory/mycluster/hosts.yaml cluster.yml -b 2>&1 | tee /tm
 # Detach: Ctrl+B then D   Reattach: tmux attach -t kubespray
 ```
 
-### Step 8: Post-kubespray setup
+### Step 7: Post-kubespray setup
 
 ```bash
 mkdir -p ~/.kube && sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config
@@ -190,14 +244,7 @@ kubectl -n kube-system get configmap coredns -o yaml | sed 's|forward . /etc/res
 kubectl -n kube-system rollout restart deployment coredns
 ```
 
-Verify:
-
-```bash
-kubectl get nodes
-kubectl get pods -A
-```
-
-### Step 9: Clone repo and deploy everything
+### Step 8: Clone repo and deploy everything
 
 ```bash
 cd ~
@@ -206,17 +253,56 @@ cd mlops-forkwise
 bash scripts/bring_up.sh
 ```
 
-This single command:
-- Disables IPv6 (Chameleon fix)
-- Creates and attaches security groups for all NodePorts
-- Deploys all K8s resources in order
-- Checks S3 for backups and restores if found (mealie-db, platform-db, qdrant, mealie-data)
-- Fixes the Mealie ingredient reference_id bug
-- Installs Prometheus + Grafana monitoring
+This single command deploys all services, restores from S3 backups if they exist, fixes known bugs, and sets up monitoring.
 
-### Step 10: Verify
+### Step 9: Upload Training Data to S3
 
-After `bring_up.sh` completes, all services are accessible:
+Before running the GISMo model, upload FlavorGraph and Recipe1MSubs to S3:
+
+```bash
+pip install awscli --break-system-packages
+export AWS_ACCESS_KEY_ID=8921c48faf83433db2b1439a9b2889fd
+export AWS_SECRET_ACCESS_KEY=7d1ce78efc5a48019888c9f3fa8ba2dd
+
+# Download FlavorGraph
+git clone https://github.com/lamypark/FlavorGraph.git /tmp/flavorgraph
+aws --endpoint-url https://chi.tacc.chameleoncloud.org:7480 s3 cp /tmp/flavorgraph/input/nodes_191120.csv s3://data-proj01/data/raw/flavorgraph/nodes_191120.csv
+aws --endpoint-url https://chi.tacc.chameleoncloud.org:7480 s3 cp /tmp/flavorgraph/input/edges_191120.csv s3://data-proj01/data/raw/flavorgraph/edges_191120.csv
+
+# Download Recipe1MSubs (from GISMo repo)
+git clone https://github.com/facebookresearch/gismo.git /tmp/gismo
+aws --endpoint-url https://chi.tacc.chameleoncloud.org:7480 s3 cp /tmp/gismo/data/recipe1msubs/train.json s3://data-proj01/data/raw/recipe1msubs/train.json
+aws --endpoint-url https://chi.tacc.chameleoncloud.org:7480 s3 cp /tmp/gismo/data/recipe1msubs/val.json s3://data-proj01/data/raw/recipe1msubs/val.json
+aws --endpoint-url https://chi.tacc.chameleoncloud.org:7480 s3 cp /tmp/gismo/data/recipe1msubs/test.json s3://data-proj01/data/raw/recipe1msubs/test.json
+```
+
+### Step 10: Build and Deploy Feedback Trainer
+
+```bash
+cd ~/mlops-forkwise/services/retraining-loop
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+docker system prune -a -f
+docker build --no-cache -t ghcr.io/krishan101/forkwise-feedback-trainer:0.1.0 .
+docker push ghcr.io/krishan101/forkwise-feedback-trainer:0.1.0
+kubectl apply -f ~/mlops-forkwise/k8s/platform/feedback-trainer.yaml
+```
+
+### Step 11: Run Initial GISMo Training
+
+```bash
+curl -s -X POST http://feedback-trainer.forkwise-platform:8001/train \
+  -H "Content-Type: application/json" \
+  -d '{"min_samples": 0, "epochs": 50, "run_name": "initial-gismo-v1"}' | python3 -m json.tool
+```
+
+Monitor progress:
+
+```bash
+kubectl -n forkwise-platform logs deploy/feedback-trainer -f
+```
+
+### Step 12: Verify
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
@@ -224,11 +310,14 @@ After `bring_up.sh` completes, all services are accessible:
 | Substitution API | `http://<FLOATING_IP>:30808/health` | — |
 | MLflow | `http://<FLOATING_IP>:30500` | — |
 | Grafana | `http://<FLOATING_IP>:30300` | admin / forkwise-admin |
+| Feedback Trainer | `http://feedback-trainer.forkwise-platform:8001/health` | cluster-internal only |
 
-Test substitution from node1:
+Test substitution:
 
 ```bash
-curl -s -X POST http://substitution-api.forkwise-platform:8080/substitute -H "Content-Type: application/json" -d '{"ingredient":"butter","recipe_name":"Classic Pancakes","top_k":5}' | python3 -m json.tool
+curl -s -X POST http://substitution-api.forkwise-platform:8080/substitute \
+  -H "Content-Type: application/json" \
+  -d '{"ingredient":"butter","recipe_name":"Classic Pancakes","top_k":5}' | python3 -m json.tool
 ```
 
 ## Building Docker Images
@@ -236,11 +325,11 @@ curl -s -X POST http://substitution-api.forkwise-platform:8080/substitute -H "Co
 If you need to rebuild any service image (after code changes), run on node1:
 
 ```bash
-# Fix IPv6 first (required for pip/HuggingFace downloads during build)
+# Fix IPv6 first
 sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
 sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
 
-# Clean disk space if needed
+# Clean disk space if needed (node1 has only 37GB)
 docker system prune -a -f
 
 # Login to GHCR
@@ -251,21 +340,10 @@ cd ~/mlops-forkwise/services/substitution-api
 docker build --no-cache -t ghcr.io/krishan101/forkwise-substitution-api:0.1.4 .
 docker push ghcr.io/krishan101/forkwise-substitution-api:0.1.4
 
-# Make package public: github.com → Packages → Package settings → Change visibility → Public
+# Make package public: github.com → Packages → Package settings → Public
 
 # Update the running deployment
 kubectl -n forkwise-platform set image deployment/substitution-api substitution-api=ghcr.io/krishan101/forkwise-substitution-api:0.1.4
-```
-
-For the Mealie fork image:
-
-```bash
-cd ~
-git clone https://github.com/HivanshD/mealie.git mealie-fork
-cd mealie-fork
-docker build -f docker/Dockerfile -t ghcr.io/krishan101/forkwise-mealie:0.1.1 .
-docker push ghcr.io/krishan101/forkwise-mealie:0.1.1
-kubectl -n forkwise-app set image deployment/mealie mealie=ghcr.io/krishan101/forkwise-mealie:0.1.1
 ```
 
 ## Backup & Restore
@@ -276,11 +354,7 @@ kubectl -n forkwise-app set image deployment/mealie mealie=ghcr.io/krishan101/fo
 bash scripts/backup.sh
 ```
 
-Snapshots to `s3://data-proj01/backups/`:
-- `mealie-db/latest.sql.gz` — Mealie postgres dump
-- `platform-db/latest.sql.gz` — Platform postgres dump (all DBs)
-- `qdrant/latest.snapshot` — Qdrant vector snapshot
-- `mealie-data/latest.tar.gz` — Mealie PVC data (uploads, config)
+Snapshots to `s3://data-proj01/backups/`: mealie-db, platform-db, qdrant, mealie-data.
 
 **Restore** happens automatically during `bring_up.sh` — if backups exist in S3, they are restored after each service deploys.
 
@@ -290,21 +364,47 @@ Snapshots to `s3://data-proj01/backups/`:
 bash scripts/teardown.sh
 ```
 
-This backs up everything to S3, then deletes all K8s namespaces. After teardown, destroy VMs from the provision notebook's teardown cells.
+Backs up everything to S3, then deletes all K8s namespaces. After teardown, destroy VMs from the provision notebook's teardown cells.
 
 ## Data Pipeline Flow
 
 1. **User adds recipe in Mealie** (via UI or API)
-2. **Ingest service** polls Mealie every 30s, detects new recipes, stores metadata + ingredients in platform postgres, queues a feature job
-3. **Feature worker** picks up the job, computes a 384-dim sentence-transformer embedding for each ingredient (contextualized by recipe name), upserts into Qdrant
-4. **User clicks "Suggest Substitute"** on any ingredient in Mealie's recipe page
-5. **Mealie backend** calls the Substitution API's `/predict` endpoint
-6. **Substitution API** embeds the query, searches Qdrant for similar ingredients from other recipes, returns ranked suggestions, logs the query to postgres
-7. **User clicks Accept/Reject** — feedback is logged to postgres via the `/feedback` endpoint for future retraining
+2. **Ingest service** polls Mealie every 30s, stores metadata + ingredients in platform postgres, queues a feature job
+3. **Feature worker** computes a 384-dim SBERT embedding for each ingredient, upserts into Qdrant
+4. **User clicks "Suggest Substitute"** → Mealie → Substitution API → Qdrant vector search → ranked results
+5. **User clicks Accept/Reject** → feedback logged to postgres
+6. **Feedback trainer** (triggered manually or on schedule) retrains GISMo on feedback + Recipe1MSubs, updates Qdrant with improved embeddings
+
+## Retraining Loop
+
+See [services/retraining-loop/GUIDE.md](services/retraining-loop/GUIDE.md) for detailed instructions on the GISMo retraining loop, including how to trigger retraining, monitor progress, and schedule automated retraining.
+
+## S3 Data Layout
+
+```
+s3://data-proj01/
+├── backups/                         # Automated backups from backup.sh
+│   ├── mealie-db/latest.sql.gz
+│   ├── platform-db/latest.sql.gz
+│   ├── qdrant/latest.snapshot
+│   └── mealie-data/latest.tar.gz
+├── data/raw/                        # Training data
+│   ├── flavorgraph/
+│   │   ├── nodes_191120.csv
+│   │   └── edges_191120.csv
+│   ├── recipe1msubs/
+│   │   ├── train.json
+│   │   ├── val.json
+│   │   └── test.json
+│   └── recipe1m/
+│       └── layer1.json (optional)
+└── mlflow-artifacts/                # MLflow experiment artifacts
+```
 
 ## Known Issues
 
-- **Mealie `reference_id` bug:** The Mealie fork generates a new UUID for each ingredient on every recipe load instead of persisting it. `bring_up.sh` works around this with a SQL UPDATE. New recipes added after deployment may need the fix re-run: `kubectl -n forkwise-app exec deploy/mealie-db -- psql -U mealie -d mealie -c "UPDATE recipes_ingredients SET reference_id = gen_random_uuid() WHERE reference_id IS NULL"`
-- **IPv6 on Chameleon:** IPv6 doesn't route on Chameleon KVM@TACC. Must disable it for Docker builds, pip installs, and HuggingFace model downloads. `bring_up.sh` handles this automatically. For manual Docker builds, run `sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1` first (keep loopback enabled for kubectl: `sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0`).
-- **Disk space:** The node1 VM has 37GB disk. Docker images (especially Mealie and the sentence-transformer services) are large. Run `docker system prune -a -f` before building if disk is low.
-- **Security groups:** Chameleon's shared project may have duplicate security group names. `bring_up.sh` creates and attaches by name; if duplicates exist, manual attachment by ID may be needed.
+- **Mealie `reference_id` bug:** The Mealie fork generates a new UUID for each ingredient on every recipe load. `bring_up.sh` works around this with a SQL UPDATE.
+- **IPv6 on Chameleon:** IPv6 doesn't route on Chameleon KVM@TACC. Must disable for Docker builds and pip installs. Keep loopback enabled (`net.ipv6.conf.lo.disable_ipv6=0`) or kubectl breaks.
+- **Disk space:** node1 has 37GB. Run `docker system prune -a -f` before building images.
+- **Security groups:** Chameleon's shared project has duplicate SG names. Terraform `data` lookups fail. Workaround: hardcode SG IDs in `data.tf` and `main.tf`.
+- **SG attachment:** Creating SGs is not enough — must also attach them to node1's sharednet1 port. `bring_up.sh` handles this automatically.
