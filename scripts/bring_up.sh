@@ -54,7 +54,22 @@ kubectl apply -f "$REPO_ROOT/k8s/platform/feature-worker.yaml"
 log "waiting for feature-worker..."
 kubectl -n forkwise-platform rollout status deployment/feature-worker --timeout=3m
 
-# --- 7. Substitution API ---
+# --- 7. MLflow ---
+log "ensuring mlflow database exists in postgres..."
+for i in {1..30}; do
+    if kubectl -n forkwise-platform exec platform-db-0 -- pg_isready -U forkwise >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+kubectl -n forkwise-platform exec platform-db-0 -- psql -U forkwise -d forkwise_mlops -tAc \
+    "SELECT 1 FROM pg_database WHERE datname='mlflow'" | grep -q 1 \
+    || kubectl -n forkwise-platform exec platform-db-0 -- psql -U forkwise -d forkwise_mlops -c "CREATE DATABASE mlflow" >/dev/null
+
+log "deploying mlflow..."
+kubectl apply -f "$REPO_ROOT/k8s/platform/mlflow.yaml"
+log "waiting for mlflow..."
+kubectl -n forkwise-platform rollout status deployment/mlflow --timeout=3m
+
+# --- 8. Substitution API ---
 log "deploying substitution-api..."
 kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
 log "waiting for substitution-api..."
@@ -79,6 +94,7 @@ log ""
 log "--- Platform ---"
 log "Platform DB   : platform-db.forkwise-platform:5432"
 log "Qdrant        : qdrant.forkwise-platform:6333"
+log "MLflow        : http://${NODE1_IP}:30500"
 log "Ingest API    : polling mealie every 30s"
 log "Feature Worker: polling feature_jobs every 5s"
 log ""

@@ -33,6 +33,7 @@ resource "openstack_networking_port_v2" "sharednet1_ports" {
     data.openstack_networking_secgroup_v2.allow_ssh.id,
     data.openstack_networking_secgroup_v2.allow_30900.id,
     data.openstack_networking_secgroup_v2.allow_30808.id,
+    data.openstack_networking_secgroup_v2.allow_30500.id,
   ]
 }
 
