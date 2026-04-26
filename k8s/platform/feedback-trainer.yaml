@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: feedback-trainer
+  namespace: forkwise-platform
+spec:
+  selector: { app: feedback-trainer }
+  ports:
+  - { port: 8001, targetPort: 8001 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feedback-trainer
+  namespace: forkwise-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feedback-trainer }
+  template:
+    metadata:
+      labels: { app: feedback-trainer }
+    spec:
+      containers:
+      - name: feedback-trainer
+        image: ghcr.io/krishan101/forkwise-feedback-trainer:0.1.0
+        imagePullPolicy: Always
+        ports: [{ containerPort: 8001 }]
+        env:
+        - { name: MLFLOW_TRACKING_URI, value: "http://mlflow:5000" }
+        - { name: MLFLOW_EXPERIMENT, value: "forkwise-gismo" }
+        - { name: POSTGRES_HOST, value: "platform-db" }
+        - { name: POSTGRES_PORT, value: "5432" }
+        - { name: POSTGRES_DB, value: "forkwise_mlops" }
+        - { name: POSTGRES_USER, value: "forkwise" }
+        - { name: POSTGRES_PASSWORD, value: "forkwise-secret-pw" }
+        - { name: QDRANT_HOST, value: "qdrant" }
+        - { name: QDRANT_PORT, value: "6333" }
+        - { name: MIN_FEEDBACK_SAMPLES, value: "10" }
+        - { name: AWS_ACCESS_KEY_ID, value: "8921c48faf83433db2b1439a9b2889fd" }
+        - { name: AWS_SECRET_ACCESS_KEY, value: "7d1ce78efc5a48019888c9f3fa8ba2dd" }
+        - { name: S3_ENDPOINT, value: "https://chi.tacc.chameleoncloud.org:7480" }
+        - { name: S3_BUCKET, value: "data-proj01" }
+        - { name: MLFLOW_S3_ENDPOINT_URL, value: "https://chi.tacc.chameleoncloud.org:7480" }
+        readinessProbe:
+          httpGet: { path: /health, port: 8001 }
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        resources:
+          requests: { cpu: 500m, memory: 2Gi }
+          limits:   { cpu: "2", memory: 4Gi }

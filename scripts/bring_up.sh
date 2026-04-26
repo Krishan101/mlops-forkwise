@@ -191,7 +191,13 @@ kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
 log "waiting for substitution-api..."
 kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=3m
 
-# --- 9. Monitoring (Prometheus + Grafana) ---
+# --- 9. Feedback Trainer ---
+log "deploying feedback-trainer..."
+kubectl apply -f "$REPO_ROOT/k8s/platform/feedback-trainer.yaml"
+log "waiting for feedback-trainer..."
+kubectl -n forkwise-platform rollout status deployment/feedback-trainer --timeout=3m
+
+# --- 10. Monitoring (Prometheus + Grafana) ---
 log "setting up monitoring..."
 bash "$REPO_ROOT/scripts/setup_monitoring.sh"
 
@@ -219,3 +225,4 @@ log "MLflow        : http://${NODE1_IP}:30500"
 log "Grafana       : http://${NODE1_IP}:30300  (admin / forkwise-admin)"
 log "Ingest API    : polling mealie every 30s"
 log "Feature Worker: polling feature_jobs every 5s"
+log "Feedback Train: http://feedback-trainer.forkwise-platform:8001/train"

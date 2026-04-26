@@ -1,0 +1,27 @@
+# GISMo training config — ForkWise ingredient substitution
+run_name: "gismo-baseline-v1"
+
+mlflow:
+  tracking_uri: "http://mlflow.forkwise-platform:5000"
+  experiment_name: "forkwise-gismo"
+
+# Model architecture
+embed_dim: 300
+num_gin_layers: 2
+decoder_hidden: 256
+dropout: 0.25
+
+# Training
+epochs: 50
+batch_size: 64
+lr: 0.00005
+weight_decay: 0.0001
+num_negatives: 10
+
+# Data
+use_recipe_context: true
+max_recipes: 100000
+
+# Evaluation
+eval_every: 5
+max_eval: 500
