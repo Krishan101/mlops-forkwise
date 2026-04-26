@@ -89,7 +89,7 @@ spec:
     spec:
       containers:
       - name: mealie
-        image: ghcr.io/mealie-recipes/mealie:v3.16.0
+        image: ghcr.io/krishan101/forkwise-mealie:0.1.0
         ports: [{ containerPort: 9000 }]
         env:
         - { name: ALLOW_SIGNUP, value: "true" }
@@ -102,6 +102,10 @@ spec:
         - { name: MAX_WORKERS, value: "1" }
         - { name: WEB_CONCURRENCY, value: "1" }
         - { name: TZ, value: "America/New_York" }
+        - { name: SUBSTITUTION_API_URL, value: "http://substitution-api.forkwise-platform:8080/predict" }
+        - { name: SUBSTITUTION_FEEDBACK_URL, value: "http://substitution-api.forkwise-platform:8080/feedback" }
+        - { name: SUBSTITUTION_API_URL, value: "http://substitution-api.forkwise-platform:8080/predict" }
+        - { name: SUBSTITUTION_FEEDBACK_URL, value: "http://substitution-api.forkwise-platform:8080/feedback" }
         volumeMounts:
         - name: app-data
           mountPath: /app/data
