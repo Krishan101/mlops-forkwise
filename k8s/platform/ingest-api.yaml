@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-api
+  namespace: forkwise-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ingest-api }
+  template:
+    metadata:
+      labels: { app: ingest-api }
+    spec:
+      containers:
+      - name: ingest-api
+        image: ghcr.io/krishan101/forkwise-ingest:0.1.0
+        env:
+        - { name: MEALIE_URL, value: "http://mealie.forkwise-app:9000" }
+        - { name: MEALIE_EMAIL, value: "krishankumargupta101@gmail.com" }
+        - { name: MEALIE_PASSWORD, value: "mynameiskrishan" }
+        - { name: POSTGRES_HOST, value: "platform-db" }
+        - { name: POSTGRES_PORT, value: "5432" }
+        - { name: POSTGRES_DB, value: "forkwise_mlops" }
+        - { name: POSTGRES_USER, value: "forkwise" }
+        - { name: POSTGRES_PASSWORD, value: "forkwise-secret-pw" }
+        - { name: POLL_INTERVAL, value: "30" }
+        resources:
+          requests: { cpu: 50m, memory: 64Mi }
+          limits:   { cpu: 200m, memory: 128Mi }
