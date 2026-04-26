@@ -104,8 +104,6 @@ spec:
         - { name: TZ, value: "America/New_York" }
         - { name: SUBSTITUTION_API_URL, value: "http://substitution-api.forkwise-platform:8080/predict" }
         - { name: SUBSTITUTION_FEEDBACK_URL, value: "http://substitution-api.forkwise-platform:8080/feedback" }
-        - { name: SUBSTITUTION_API_URL, value: "http://substitution-api.forkwise-platform:8080/predict" }
-        - { name: SUBSTITUTION_FEEDBACK_URL, value: "http://substitution-api.forkwise-platform:8080/feedback" }
         volumeMounts:
         - name: app-data
           mountPath: /app/data

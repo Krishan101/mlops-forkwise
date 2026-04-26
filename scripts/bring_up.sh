@@ -14,6 +14,45 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 log "repo root: $REPO_ROOT"
 
+# --- 0. IPv6 fix (Chameleon IPv6 doesn't route; breaks HuggingFace, NLTK, pip) ---
+log "disabling IPv6 (except loopback for kubectl)..."
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null
+
+# --- 0b. Security Groups ---
+log "ensuring security groups exist and are attached..."
+OS_CLOUD="${OS_CLOUD:-openstack}"
+declare -A SG_PORTS=(
+    ["allow-ssh"]=22
+    ["allow-30900"]=30900
+    ["allow-30808"]=30808
+    ["allow-30500"]=30500
+)
+
+existing_sgs=$(openstack --os-cloud "$OS_CLOUD" security group list -f value -c Name 2>/dev/null || echo "")
+for sg_name in "${!SG_PORTS[@]}"; do
+    port="${SG_PORTS[$sg_name]}"
+    if ! grep -qx "$sg_name" <<<"$existing_sgs"; then
+        log "  creating SG $sg_name (tcp/$port)"
+        openstack --os-cloud "$OS_CLOUD" security group create "$sg_name" --description "auto: forkwise" >/dev/null 2>&1 || true
+    fi
+    openstack --os-cloud "$OS_CLOUD" security group rule create --protocol tcp --dst-port "$port" --remote-ip 0.0.0.0/0 "$sg_name" >/dev/null 2>&1 || true
+done
+
+# Attach SGs to node1's sharednet1 port
+NODE1_SHAREDNET_PORT=$(openstack --os-cloud "$OS_CLOUD" port list --server "$(hostname)" -f value -c ID 2>/dev/null | head -1)
+if [[ -n "$NODE1_SHAREDNET_PORT" ]]; then
+    for sg_name in "${!SG_PORTS[@]}"; do
+        sg_id=$(openstack --os-cloud "$OS_CLOUD" security group list -f value -c ID -c Name 2>/dev/null | grep " ${sg_name}$" | head -1 | awk '{print $1}')
+        if [[ -n "$sg_id" ]]; then
+            openstack --os-cloud "$OS_CLOUD" port set "$NODE1_SHAREDNET_PORT" --security-group "$sg_id" >/dev/null 2>&1 || true
+        fi
+    done
+    log "  SGs attached to node1 port"
+else
+    warn "  could not find node1 port — attach SGs manually"
+fi
+
 # --- 1. Namespaces ---
 log "creating namespaces..."
 kubectl apply -f "$REPO_ROOT/k8s/mealie/namespace.yaml"
@@ -41,6 +80,15 @@ log "waiting for mealie-db..."
 kubectl -n forkwise-app rollout status deployment/mealie-db --timeout=3m
 log "waiting for mealie..."
 kubectl -n forkwise-app rollout status deployment/mealie --timeout=5m
+
+# Fix: populate reference_id for ingredients (Mealie fork bug — NULLs break substitution lookups)
+log "fixing ingredient reference_ids in mealie DB..."
+for i in {1..15}; do
+    if kubectl -n forkwise-app exec deploy/mealie-db -- psql -U mealie -d mealie -c "SELECT 1" >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+kubectl -n forkwise-app exec deploy/mealie-db -- psql -U mealie -d mealie -c \
+    "UPDATE recipes_ingredients SET reference_id = gen_random_uuid() WHERE reference_id IS NULL" >/dev/null 2>&1 || warn "reference_id fix failed (may not be needed)"
 
 # --- 5. Ingest Service ---
 log "deploying ingest-api..."
