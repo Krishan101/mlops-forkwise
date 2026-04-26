@@ -24,7 +24,8 @@ spec:
     spec:
       containers:
       - name: mlflow
-        image: ghcr.io/mlflow/mlflow:v2.19.0
+        image: ghcr.io/krishan101/forkwise-mlflow:0.1.0
+        imagePullPolicy: Always
         ports: [{ containerPort: 5000 }]
         command: ["mlflow", "server"]
         args:
@@ -37,5 +38,5 @@ spec:
         - { name: AWS_SECRET_ACCESS_KEY, value: "7d1ce78efc5a48019888c9f3fa8ba2dd" }
         - { name: MLFLOW_S3_ENDPOINT_URL, value: "https://chi.tacc.chameleoncloud.org:7480" }
         resources:
-          requests: { cpu: 100m, memory: 256Mi }
-          limits:   { cpu: 500m, memory: 512Mi }
+          requests: { cpu: 100m, memory: 512Mi }
+          limits:   { cpu: 500m, memory: 1Gi }
