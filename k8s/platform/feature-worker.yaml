@@ -13,7 +13,7 @@ spec:
     spec:
       containers:
       - name: feature-worker
-        image: ghcr.io/krishan101/forkwise-feature-worker:0.1.2
+        image: ghcr.io/krishan101/forkwise-feature-worker:0.1.3
         env:
         - { name: POSTGRES_HOST, value: "platform-db" }
         - { name: POSTGRES_PORT, value: "5432" }
