@@ -13,3 +13,7 @@ data "openstack_networking_secgroup_v2" "allow_ssh" {
 data "openstack_networking_secgroup_v2" "allow_30900" {
   name = "allow-30900"
 }
+
+data "openstack_networking_secgroup_v2" "allow_30808" {
+  name = "allow-30808"
+}

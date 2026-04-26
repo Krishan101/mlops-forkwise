@@ -54,6 +54,12 @@ kubectl apply -f "$REPO_ROOT/k8s/platform/feature-worker.yaml"
 log "waiting for feature-worker..."
 kubectl -n forkwise-platform rollout status deployment/feature-worker --timeout=3m
 
+# --- 7. Substitution API ---
+log "deploying substitution-api..."
+kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
+log "waiting for substitution-api..."
+kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=3m
+
 # --- Summary ---
 log ""
 log "============================================"
@@ -67,6 +73,8 @@ log ""
 log "--- Services ---"
 log "Mealie        : http://${NODE1_IP}:30900"
 log "               default login: create account on first visit"
+log "Substitution  : http://${NODE1_IP}:30808/substitute"
+log "  try: curl -X POST http://${NODE1_IP}:30808/substitute -H 'Content-Type: application/json' -d '{\"ingredient\":\"butter\",\"recipe_name\":\"Classic Pancakes\",\"top_k\":5}'"
 log ""
 log "--- Platform ---"
 log "Platform DB   : platform-db.forkwise-platform:5432"
