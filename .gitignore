@@ -1,0 +1,9 @@
+clouds.yaml
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+__pycache__/
+.ipynb_checkpoints/
