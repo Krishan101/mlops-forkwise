@@ -594,7 +594,7 @@ def feedback(body: MealieFeedbackRequest):
                    LIMIT 1""",
                 (rid, body.suggested_substitution,
                  "accept" if body.user_accepted else "reject",
-                 body.request_id, body.suggested_substitution),
+                 rid, body.suggested_substitution),
             )
             conn.commit()
         conn.close()

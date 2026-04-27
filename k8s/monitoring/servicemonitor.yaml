@@ -13,6 +13,6 @@ spec:
     matchLabels:
       app: substitution-api
   endpoints:
-  - port: "8080"
+  - port: "http"
     path: /metrics
     interval: 15s
