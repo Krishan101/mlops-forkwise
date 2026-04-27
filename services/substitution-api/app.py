@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Histogram, Counter
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
@@ -60,6 +61,38 @@ MODEL_VERSION = os.environ.get("MODEL_VERSION", "current")  # "current" or "prev
 sentence_model = None
 qdrant = None
 gismo_scorer = None
+
+# --- Custom Prometheus metrics for drift detection ---
+GISMO_SCORE_HISTOGRAM = Histogram(
+    'forkwise_gismo_top_score',
+    'Distribution of top GISMo reranking score per query',
+    buckets=[-5, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 5, 10]
+)
+
+UNKNOWN_INGREDIENT_COUNTER = Counter(
+    'forkwise_unknown_ingredient_total',
+    'Number of query ingredients not found in GISMo vocabulary'
+)
+
+KNOWN_INGREDIENT_COUNTER = Counter(
+    'forkwise_known_ingredient_total',
+    'Number of query ingredients found in GISMo vocabulary'
+)
+
+QDRANT_FALLBACK_COUNTER = Counter(
+    'forkwise_qdrant_fallback_total',
+    'Queries where GISMo scoring failed and fell back to Qdrant-only'
+)
+
+FEEDBACK_ACCEPT_COUNTER = Counter(
+    'forkwise_feedback_accept_total',
+    'Total accepted substitution suggestions'
+)
+
+FEEDBACK_REJECT_COUNTER = Counter(
+    'forkwise_feedback_reject_total',
+    'Total rejected substitution suggestions'
+)
 
 
 # =========================================================================
@@ -342,6 +375,13 @@ def search_substitutions(ingredient_text: str, recipe_name: str, top_k: int,
         candidate_names = [c["ingredient"] for c in candidates]
         context_ingredients = recipe_ingredients or []
 
+        # Track whether query ingredient is in GISMo vocabulary
+        source_idx = gismo_scorer.get_ingredient_idx(ingredient_text)
+        if source_idx is not None:
+            KNOWN_INGREDIENT_COUNTER.inc()
+        else:
+            UNKNOWN_INGREDIENT_COUNTER.inc()
+
         gismo_scores = gismo_scorer.score_candidates(
             ingredient_text, candidate_names, context_ingredients
         )
@@ -358,9 +398,16 @@ def search_substitutions(ingredient_text: str, recipe_name: str, top_k: int,
 
             # Sort by GISMo score descending (None scores go to the end)
             candidates.sort(key=lambda x: (x["gismo_score"] is not None, x.get("gismo_score", -999)), reverse=True)
+
+            # Record top score for drift detection
+            top_gismo = [c.get("gismo_score") for c in candidates if c.get("gismo_score") is not None]
+            if top_gismo:
+                GISMO_SCORE_HISTOGRAM.observe(top_gismo[0])
+
             log.info(f"  GISMo reranked {len(candidates)} candidates")
         else:
             # GISMo scoring failed for this query, use Qdrant scores
+            QDRANT_FALLBACK_COUNTER.inc()
             for c in candidates:
                 c["score"] = c["qdrant_score"]
     else:
@@ -599,6 +646,11 @@ def feedback(body: MealieFeedbackRequest):
             conn.commit()
         conn.close()
         key = f"{body.request_id}:{body.suggested_substitution}"
+        # Track accept/reject for drift monitoring
+        if body.user_accepted:
+            FEEDBACK_ACCEPT_COUNTER.inc()
+        else:
+            FEEDBACK_REJECT_COUNTER.inc()
         log.info(f"[mealie] feedback request_id={body.request_id} "
                  f"ingredient={body.suggested_substitution} accepted={body.user_accepted}")
         return MealieFeedbackResponse(status="logged", key=key)
