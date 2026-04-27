@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: substitution-api
+  namespace: monitoring
+  labels:
+    release: kube-prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+    - forkwise-platform
+  selector:
+    matchLabels:
+      app: substitution-api
+  endpoints:
+  - port: "8080"
+    path: /metrics
+    interval: 15s

@@ -1,0 +1,230 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: retrain-check-script
+  namespace: forkwise-platform
+data:
+  check_and_retrain.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "=== ForkWise Retrain Check ==="
+    echo "Time: $(date -u)"
+
+    # Config
+    FEEDBACK_THRESHOLD="${FEEDBACK_THRESHOLD:-50}"
+    GPU_HOST="${GPU_HOST}"
+    SSH_KEY_PATH="/root/.ssh/forkwise-key"
+    S3_ENDPOINT="https://chi.tacc.chameleoncloud.org:7480"
+    S3_BUCKET="data-proj01"
+
+    export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+    export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+
+    # Step 1: Count untrained feedback
+    echo "Checking untrained feedback count..."
+    FEEDBACK_COUNT=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -h "${POSTGRES_HOST}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -t -A -c \
+        "SELECT COUNT(*) FROM feedback_events fe JOIN substitution_results sr ON fe.query_id = sr.query_id AND fe.suggested_ingredient = sr.suggested_ingredient WHERE sr.trained_at IS NULL;")
+
+    echo "Untrained feedback: ${FEEDBACK_COUNT} (threshold: ${FEEDBACK_THRESHOLD})"
+
+    if [ "${FEEDBACK_COUNT}" -lt "${FEEDBACK_THRESHOLD}" ]; then
+        echo "Below threshold. No retraining needed."
+        exit 0
+    fi
+
+    echo "Threshold met! Starting retraining pipeline..."
+
+    # Step 2: Export feedback
+    FEEDBACK_FILE="/tmp/feedback_export.json"
+    PGPASSWORD="${POSTGRES_PASSWORD}" psql -h "${POSTGRES_HOST}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -t -A -c "
+    SELECT json_agg(row_to_json(t))
+    FROM (
+        SELECT sq.original_ingredient AS original, sr.suggested_ingredient AS replacement,
+               sq.recipe_id, sr.accepted, fe.event_type
+        FROM feedback_events fe
+        JOIN substitution_queries sq ON fe.query_id = sq.query_id
+        JOIN substitution_results sr ON fe.query_id = sr.query_id AND fe.suggested_ingredient = sr.suggested_ingredient
+        WHERE sr.trained_at IS NULL
+    ) t;" > "$FEEDBACK_FILE"
+
+    # Step 3: Convert to training tuples
+    TUPLES_FILE="/tmp/feedback_tuples.json"
+    python3 -c "
+    import json
+    with open('$FEEDBACK_FILE') as f:
+        data = json.load(f)
+    tuples = [{'recipe_id': d.get('recipe_id','feedback'), 'original': d['original'], 'replacement': d['replacement']}
+              for d in (data or []) if d.get('event_type')=='accept' and d.get('accepted')==1]
+    with open('$TUPLES_FILE','w') as f:
+        json.dump(tuples, f)
+    print(f'Converted {len(tuples)} positive tuples')
+    "
+
+    # Step 4: Download base training data and merge
+    MERGED_FILE="/tmp/train_merged.json"
+    aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://$S3_BUCKET/data/raw/recipe1msubs/train.json" /tmp/base_train.json
+
+    python3 -c "
+    import json
+    with open('/tmp/base_train.json') as f: base = json.load(f)
+    with open('$TUPLES_FILE') as f: fb = json.load(f)
+    merged = base + fb
+    with open('$MERGED_FILE','w') as f: json.dump(merged, f)
+    print(f'Merged: {len(base)} base + {len(fb)} feedback = {len(merged)} total')
+    "
+
+    # Step 5: Upload merged data to GPU and run training
+    echo "Uploading merged data to GPU instance..."
+    scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$MERGED_FILE" cc@"$GPU_HOST":~/training/data/recipe1msubs/train.json
+
+    echo "Cleaning previous output on GPU..."
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "sudo chown -R cc:cc ~/training/output 2>/dev/null; rm -f ~/training/output/*"
+
+    MLFLOW_URI="http://mlflow.forkwise-platform:5000"
+
+    echo "Starting training on GPU..."
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "docker run --rm --gpus all \
+      -v ~/training/data:/app/data -v ~/training/output:/app/output \
+      gismo-train --data-dir /app/data --output-dir /app/output \
+      --max-epochs 30 --patience 8 --eval-candidates 100 --batch-size 512 \
+      --num-neg 32 --emb-dim 300 --lr 2e-4 --mlflow-uri $MLFLOW_URI"
+
+    echo "Generating artifacts..."
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "sudo chown -R cc:cc ~/training/output && \
+      docker run --rm --gpus all --entrypoint python \
+      -v ~/training/data:/home/cc/training/data -v ~/training/output:/home/cc/training/output \
+      -v ~/training/src:/home/cc/training/src gismo-train /home/cc/training/src/fixup_artifacts.py"
+
+    # Step 6: Compare and promote
+    CURRENT_MRR=$(aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://$S3_BUCKET/models/v2/metadata.json" - 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('test_mrr',0))" || echo "0")
+    NEW_MRR=$(ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "cat ~/training/output/metadata.json" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('test_mrr',0))")
+
+    echo "Current MRR: $CURRENT_MRR, New MRR: $NEW_MRR"
+
+    SHOULD_PROMOTE=$(python3 -c "print('yes' if float('$NEW_MRR') >= float('$CURRENT_MRR') * 0.95 else 'no')")
+
+    if [ "$SHOULD_PROMOTE" = "no" ]; then
+        echo "New model significantly worse. Skipping promotion."
+        exit 0
+    fi
+
+    # Backup current as previous
+    for f in gismo_decoder.onnx ingredient_embeddings.npy vocab.json metadata.json; do
+        base="${f%.*}"; ext="${f##*.}"
+        aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://$S3_BUCKET/models/v2/$f" "s3://$S3_BUCKET/models/v2/${base}_previous.${ext}" --quiet 2>/dev/null || true
+    done
+
+    # Upload new model
+    for f in gismo_decoder.onnx ingredient_embeddings.npy vocab.json metadata.json gismo_best.pth; do
+        ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "cat ~/training/output/$f" \
+            | aws --endpoint-url "$S3_ENDPOINT" s3 cp - "s3://$S3_BUCKET/models/v2/$f"
+    done
+
+    # Restart API — use kubectl from the host via the API server
+    # The CronJob pod has access to the K8s API via the service account
+    APISERVER="https://kubernetes.default.svc"
+    TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    curl -s -k -X PATCH "$APISERVER/apis/apps/v1/namespaces/forkwise-platform/deployments/substitution-api" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/strategic-merge-patch+json" \
+        -d "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"retrain-timestamp\":\"$(date +%s)\"}}}}}"
+
+    # Mark feedback as consumed
+    PGPASSWORD="${POSTGRES_PASSWORD}" psql -h "${POSTGRES_HOST}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c \
+        "UPDATE substitution_results SET trained_at = NOW() WHERE trained_at IS NULL AND accepted IS NOT NULL;"
+
+    echo "=== Retraining complete! Model promoted. ==="
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: retrain-ssh-key
+  namespace: forkwise-platform
+type: Opaque
+data:
+  # This will be populated manually: kubectl create secret generic retrain-ssh-key --from-file=forkwise-key=$HOME/.ssh/forkwise-key -n forkwise-platform
+  placeholder: cGxhY2Vob2xkZXI=
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: retrain-deployer
+  namespace: forkwise-platform
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: retrain-deployer-binding
+  namespace: forkwise-platform
+subjects:
+- kind: ServiceAccount
+  name: retrain-sa
+  namespace: forkwise-platform
+roleRef:
+  kind: Role
+  name: retrain-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: retrain-sa
+  namespace: forkwise-platform
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: retrain-check
+  namespace: forkwise-platform
+spec:
+  schedule: "0 */6 * * *"  # Every 6 hours
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 7200  # 2 hour timeout
+      template:
+        spec:
+          serviceAccountName: retrain-sa
+          restartPolicy: Never
+          volumes:
+          - name: ssh-key
+            secret:
+              secretName: retrain-ssh-key
+              defaultMode: 0600
+          - name: script
+            configMap:
+              name: retrain-check-script
+              defaultMode: 0755
+          containers:
+          - name: retrain
+            image: python:3.12-slim
+            command: ["/bin/bash", "/scripts/check_and_retrain.sh"]
+            volumeMounts:
+            - name: ssh-key
+              mountPath: /root/.ssh
+              readOnly: true
+            - name: script
+              mountPath: /scripts
+            env:
+            - { name: POSTGRES_HOST, value: "platform-db" }
+            - { name: POSTGRES_PORT, value: "5432" }
+            - { name: POSTGRES_DB, value: "forkwise_mlops" }
+            - { name: POSTGRES_USER, value: "forkwise" }
+            - { name: POSTGRES_PASSWORD, value: "forkwise-secret-pw" }
+            - { name: GPU_HOST, value: "129.114.25.172" }
+            - { name: FEEDBACK_THRESHOLD, value: "50" }
+            - { name: AWS_ACCESS_KEY_ID, value: "8921c48faf83433db2b1439a9b2889fd" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "7d1ce78efc5a48019888c9f3fa8ba2dd" }
+            resources:
+              requests: { cpu: 100m, memory: 256Mi }
+              limits: { cpu: 500m, memory: 512Mi }

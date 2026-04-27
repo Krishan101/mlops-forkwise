@@ -1,0 +1,141 @@
+{
+  "id": null,
+  "title": "ForkWise Substitution Service",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Substitution Requests per Second",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{handler=~\"/substitute|/predict\"}[1m]))",
+          "legendFormat": "requests/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "timeseries",
+      "title": "Request Latency (ms)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "1000 * histogram_quantile(0.5, rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[1m]))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[1m]))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[1m]))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "timeseries",
+      "title": "Error Responses per Second",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{handler=~\"/substitute|/predict\", status=~\"4..|5..\"}[1m]))",
+          "legendFormat": "errors/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "stat",
+      "title": "Total Requests (last 1h)",
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(http_requests_total{handler=~\"/substitute|/predict\"}[1h]))",
+          "legendFormat": "total",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "stat",
+      "title": "Feedback Events (last 1h)",
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(http_requests_total{handler=\"/feedback\"}[1h]))",
+          "legendFormat": "feedback",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "timeseries",
+      "title": "Feedback Accept vs Reject Rate",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{handler=\"/feedback\", status=\"200\"}[5m]))",
+          "legendFormat": "feedback/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "table",
+      "title": "Pod Resource Usage",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(container_memory_working_set_bytes{namespace=\"forkwise-platform\", container!=\"\"}) by (pod) / 1e6",
+          "legendFormat": "{{pod}}",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decmbytes" }
+      },
+      "datasource": "prometheus"
+    }
+  ]
+}
