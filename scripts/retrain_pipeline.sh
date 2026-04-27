@@ -5,6 +5,11 @@
 # Exports feedback from Postgres, merges with base training data,
 # retrains GISMo on the GPU instance, evaluates, and promotes if improved.
 #
+# Quality gates:
+#   1. Absolute: new model MRR must be >= MIN_ABSOLUTE_MRR (default 10.0)
+#   2. Relative: new model MRR must be >= 95% of current deployed model's MRR
+#   Both gates must pass for the model to be promoted.
+#
 # Usage:
 #   From node1:
 #     bash scripts/retrain_pipeline.sh <GPU_HOST_IP>
@@ -41,7 +46,8 @@ export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-7d1ce78efc5a48019888c9f3f
 export PATH="$HOME/.local/bin:$PATH"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-MIN_FEEDBACK=5  # Minimum feedback events to trigger retraining
+MIN_FEEDBACK=5           # Minimum feedback events to trigger retraining
+MIN_ABSOLUTE_MRR=10.0    # Minimum test MRR to deploy any model (quality gate)
 
 # =========================================================================
 # Step 1: Export feedback from Postgres
@@ -132,10 +138,8 @@ MERGED_TRAIN="$WORKDIR/train_merged.json"
 
 python3 << MERGE_EOF
 import json
-
-# Load base training data from S3 (cached on GPU, but we have a copy)
-# We'll download it here for the merge, then send merged file to GPU
 import subprocess
+
 result = subprocess.run([
     "aws", "--endpoint-url", "$S3_ENDPOINT",
     "s3", "cp", "s3://$S3_BUCKET/data/raw/recipe1msubs/train.json",
@@ -148,7 +152,6 @@ with open("$WORKDIR/base_train.json") as f:
 with open("$FEEDBACK_TUPLES") as f:
     feedback_tuples = json.load(f)
 
-# Merge: base + feedback
 merged = base + feedback_tuples
 
 with open("$MERGED_TRAIN", "w") as f:
@@ -170,7 +173,6 @@ log "  Uploaded merged train.json to GPU instance"
 # =========================================================================
 log "Step 5: Running retraining on GPU instance..."
 
-# Get current model's test MRR for comparison
 CURRENT_MRR=$(aws --endpoint-url "$S3_ENDPOINT" \
     s3 cp "s3://$S3_BUCKET/models/v2/metadata.json" - 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('test_mrr', 0))" 2>/dev/null \
@@ -183,10 +185,11 @@ ssh $SSH_OPTS cc@"$GPU_HOST" << RETRAIN_SSH
 set -e
 export PATH="\$HOME/.local/bin:\$PATH"
 
-# Clear previous output
+# Clear previous output (fix permissions from Docker root ownership)
+sudo chown -R cc:cc ~/training/output 2>/dev/null || true
 rm -f ~/training/output/*
 
-# Run training with warm start settings (fewer epochs since we're fine-tuning)
+# Run training
 docker run --rm --gpus all \
   -v ~/training/data:/app/data \
   -v ~/training/output:/app/output \
@@ -208,7 +211,7 @@ RETRAIN_SSH
 log "  Retraining completed on GPU"
 
 # =========================================================================
-# Step 6: Generate missing artifacts (embeddings, vocab, metadata)
+# Step 6: Generate artifacts (embeddings, vocab, metadata)
 # =========================================================================
 log "Step 6: Generating artifacts on GPU..."
 
@@ -216,6 +219,7 @@ scp $SSH_OPTS "$REPO_ROOT/scripts/fixup_artifacts.py" cc@"$GPU_HOST":~/training/
 
 ssh $SSH_OPTS cc@"$GPU_HOST" << FIXUP_SSH
 set -e
+sudo chown -R cc:cc ~/training/output 2>/dev/null || true
 docker run --rm --gpus all \
   --entrypoint python \
   -v ~/training/data:/home/cc/training/data \
@@ -230,23 +234,36 @@ FIXUP_SSH
 log "  Artifacts generated"
 
 # =========================================================================
-# Step 7: Get new model's test MRR and compare
+# Step 7: Quality gates — evaluate new model
 # =========================================================================
-log "Step 7: Evaluating new model..."
+log "Step 7: Evaluating new model against quality gates..."
 
 NEW_MRR=$(ssh $SSH_OPTS cc@"$GPU_HOST" "cat ~/training/output/metadata.json" \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('test_mrr', 0))")
 
-log "  New model test MRR: $NEW_MRR"
+log "  New model test MRR:     $NEW_MRR"
 log "  Current model test MRR: $CURRENT_MRR"
+log "  Minimum absolute MRR:   $MIN_ABSOLUTE_MRR"
 
-PROMOTE=$(python3 -c "print('yes' if float('$NEW_MRR') >= float('$CURRENT_MRR') else 'no')")
-
-if [[ "$PROMOTE" == "no" ]]; then
-    warn "  New model ($NEW_MRR) did not improve over current ($CURRENT_MRR)"
-    warn "  Keeping current model. Retrain artifacts saved on GPU instance."
-    exit 0
+# Quality gate 1: absolute minimum MRR
+PASSES_ABSOLUTE=$(python3 -c "print('yes' if float('$NEW_MRR') >= $MIN_ABSOLUTE_MRR else 'no')")
+if [[ "$PASSES_ABSOLUTE" == "no" ]]; then
+    warn "  QUALITY GATE FAILED: New model MRR ($NEW_MRR) below absolute minimum ($MIN_ABSOLUTE_MRR)"
+    warn "  Model will NOT be deployed. Check training data quality."
+    exit 1
 fi
+log "  ✓ Passes absolute MRR gate ($NEW_MRR >= $MIN_ABSOLUTE_MRR)"
+
+# Quality gate 2: must be at least 95% of current model's MRR
+PASSES_RELATIVE=$(python3 -c "print('yes' if float('$NEW_MRR') >= float('$CURRENT_MRR') * 0.95 else 'no')")
+if [[ "$PASSES_RELATIVE" == "no" ]]; then
+    warn "  QUALITY GATE FAILED: New model MRR ($NEW_MRR) is >5% worse than current ($CURRENT_MRR)"
+    warn "  Model will NOT be deployed. Keeping current model."
+    exit 1
+fi
+log "  ✓ Passes relative MRR gate ($NEW_MRR >= 95% of $CURRENT_MRR)"
+
+log "  Both quality gates passed! Proceeding with promotion."
 
 # =========================================================================
 # Step 8: Promote new model
@@ -278,10 +295,14 @@ log "  Model uploaded to S3"
 # =========================================================================
 log "Step 9: Restarting substitution API..."
 
+# Delete PVC to force re-download of new model on next pod start
+kubectl -n forkwise-platform delete pvc gismo-model-pvc --ignore-not-found 2>/dev/null || true
+sleep 3
+kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
 kubectl -n forkwise-platform rollout restart deployment/substitution-api
-kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=3m
+kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=5m
 
-log "  Substitution API restarted"
+log "  Substitution API restarted with new model"
 
 # =========================================================================
 # Step 10: Mark feedback as consumed
@@ -301,9 +322,11 @@ log ""
 log "============================================"
 log "  Retraining pipeline complete!"
 log "============================================"
-log "  Previous MRR: $CURRENT_MRR"
-log "  New MRR:      $NEW_MRR"
-log "  Feedback used: $FEEDBACK_COUNT events"
+log "  Previous MRR:        $CURRENT_MRR"
+log "  New MRR:             $NEW_MRR"
+log "  Absolute gate:       >= $MIN_ABSOLUTE_MRR ✓"
+log "  Relative gate:       >= 95% of previous ✓"
+log "  Feedback used:       $FEEDBACK_COUNT events"
 log "  Model promoted and deployed"
-log "  Timestamp: $TIMESTAMP"
+log "  Timestamp:           $TIMESTAMP"
 log "============================================"
