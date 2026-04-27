@@ -197,16 +197,19 @@ The retraining pipeline runs either manually or via the CronJob (every 6 hours):
 ```
 Feedback in Postgres (≥ 50 events)
   → Export accepted feedback
+  → Validate: deduplicate + remove contradictory pairs
   → Merge with base Recipe1MSubs training data (49K samples)
   → Upload to GPU instance
   → Train GISMo (30 epochs, early stopping)
   → Generate ONNX + embeddings + vocab
-  → Quality Gate 1: test MRR ≥ 10.0 (absolute minimum)
-  → Quality Gate 2: test MRR ≥ 95% of current model
+  → STAGING: Quality Gate 1 — test MRR ≥ 10.0 (absolute minimum)
+  → STAGING: Quality Gate 2 — test MRR ≥ 95% of current model
   → Backup current model as _previous
   → Upload new model to S3
   → Restart substitution API (init container re-downloads)
-  → Mark feedback as consumed
+  → CANARY: Send 20 test queries, verify ≤ 3 failures
+    → FAIL: auto-rollback to previous model
+    → PASS: mark feedback consumed, model is live in PRODUCTION
 ```
 
 Manual trigger:
@@ -218,6 +221,12 @@ bash scripts/retrain_pipeline.sh <GPU_IP>
 
 **Prometheus** scrapes the substitution API's `/metrics` endpoint every 15s via ServiceMonitor.
 
+**Custom drift detection metrics:**
+- `forkwise_gismo_top_score` — GISMo score distribution (histogram)
+- `forkwise_unknown_ingredient_total` — queries with unknown ingredients
+- `forkwise_qdrant_fallback_total` — queries falling back to Qdrant-only
+- `forkwise_feedback_accept_total` / `forkwise_feedback_reject_total` — accept/reject ratio
+
 **Grafana dashboard** (imported from `k8s/monitoring/grafana-dashboard.json`) includes:
 - Substitution requests per second
 - Request latency (p50/p95/p99)
@@ -228,6 +237,8 @@ bash scripts/retrain_pipeline.sh <GPU_IP>
 - Latency alert: fires if p95 > 1 second for 5 minutes
 - Pod restarts (last 24h)
 - GISMo model active status
+
+**Autoscaling:** HPA scales the substitution API from 1 to 3 replicas at 70% CPU utilization.
 
 ## Rollback
 
@@ -248,8 +259,11 @@ See `docs/SAFEGUARDING.md` for the full safeguarding plan covering:
 - **Explainability:** Score transparency, model info endpoint, MLflow lineage
 - **Transparency:** Visible ML labels, model version in responses, open source
 - **Privacy:** Self-hosted, no PII in training, minimal data collection
-- **Accountability:** Full audit trail, rollback, quality gates
-- **Robustness:** Graceful fallback, input normalization, probes, backup/restore
+- **Accountability:** Full audit trail, rollback, quality gates, canary validation
+- **Robustness:** Graceful fallback, input normalization, probes, HPA, backup/restore
+- **Threshold justifications:** All numeric thresholds (MRR gates, alert rules, HPA targets) explicitly justified
+- **Multi-environment strategy:** Logical staging/canary/production flow documented
+- **Data quality:** Three-stage validation (ingestion, training data construction, production drift detection)
 
 ## Known Issues
 
