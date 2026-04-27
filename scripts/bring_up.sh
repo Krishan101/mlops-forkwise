@@ -185,15 +185,43 @@ kubectl apply -f "$REPO_ROOT/k8s/platform/mlflow.yaml"
 log "waiting for mlflow..."
 kubectl -n forkwise-platform rollout status deployment/mlflow --timeout=3m
 
-# --- 8. Substitution API ---
-log "deploying substitution-api..."
+# --- 8. Substitution API (with GISMo model) ---
+log "deploying substitution-api (with GISMo ONNX reranking)..."
 kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
 log "waiting for substitution-api..."
-kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=3m
+kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=5m
+
+# Add service label for Prometheus ServiceMonitor
+kubectl -n forkwise-platform label svc substitution-api app=substitution-api --overwrite 2>/dev/null || true
 
 # --- 9. Monitoring (Prometheus + Grafana) ---
 log "setting up monitoring..."
 bash "$REPO_ROOT/scripts/setup_monitoring.sh"
+
+# --- 10. GISMo-specific resources ---
+log "deploying GISMo resources (ServiceMonitor, CronJob)..."
+
+# Apply ServiceMonitor for substitution API metrics scraping
+if [[ -f "$REPO_ROOT/k8s/monitoring/servicemonitor.yaml" ]]; then
+    kubectl apply -f "$REPO_ROOT/k8s/monitoring/servicemonitor.yaml"
+    log "  ServiceMonitor applied"
+fi
+
+# Create SSH key secret for retraining CronJob
+if [[ -f "$HOME/.ssh/forkwise-key" ]]; then
+    kubectl -n forkwise-platform create secret generic retrain-ssh-key \
+        --from-file=forkwise-key="$HOME/.ssh/forkwise-key" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    log "  retrain SSH key secret created"
+else
+    warn "  SSH key not found at ~/.ssh/forkwise-key — CronJob won't be able to SSH to GPU"
+fi
+
+# Apply retraining CronJob + RBAC
+if [[ -f "$REPO_ROOT/k8s/platform/retrain-cronjob.yaml" ]]; then
+    kubectl apply -f "$REPO_ROOT/k8s/platform/retrain-cronjob.yaml"
+    log "  retraining CronJob applied"
+fi
 
 # --- Summary ---
 log ""
@@ -219,3 +247,12 @@ log "MLflow        : http://${NODE1_IP}:30500"
 log "Grafana       : http://${NODE1_IP}:30300  (admin / forkwise-admin)"
 log "Ingest API    : polling mealie every 30s"
 log "Feature Worker: polling feature_jobs every 5s"
+log ""
+log "--- GISMo ---"
+log "Model         : ONNX decoder from s3://data-proj01/models/v2/"
+log "Reranking     : enabled (GISMO_ENABLED=true)"
+log "CronJob       : retrain-check (every 6h, threshold 50 feedback events)"
+log "ServiceMonitor: substitution-api -> Prometheus"
+log ""
+log "--- Model Info ---"
+log "  curl http://${NODE1_IP}:30808/admin/model-info"
