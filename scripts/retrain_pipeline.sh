@@ -106,6 +106,7 @@ FEEDBACK_TUPLES="$WORKDIR/feedback_tuples.json"
 
 python3 << CONVERT_EOF
 import json
+from collections import Counter
 
 with open("$FEEDBACK_FILE") as f:
     feedback = json.load(f)
@@ -113,10 +114,34 @@ with open("$FEEDBACK_FILE") as f:
 if feedback is None:
     feedback = []
 
-# Convert accepted feedback to positive substitution tuples
+# Separate accepts and rejects
+accepts = set()
+rejects = set()
+for fb in feedback:
+    key = (fb["original"].lower().strip(), fb["replacement"].lower().strip())
+    if fb.get("event_type") == "accept" and fb.get("accepted") == 1:
+        accepts.add(key)
+    elif fb.get("event_type") == "reject":
+        rejects.add(key)
+
+# Detect contradictions: same pair both accepted and rejected
+contradictions = accepts & rejects
+if contradictions:
+    print(f"  WARNING: {len(contradictions)} contradictory pairs (both accepted and rejected)")
+    for orig, repl in list(contradictions)[:5]:
+        print(f"    {orig} -> {repl}")
+
+# Build tuples: only accepted, not contradicted, deduplicated
+seen = set()
 tuples = []
 for fb in feedback:
     if fb.get("event_type") == "accept" and fb.get("accepted") == 1:
+        key = (fb["original"].lower().strip(), fb["replacement"].lower().strip())
+        if key in contradictions:
+            continue  # Skip contradictory pairs
+        if key in seen:
+            continue  # Skip duplicates
+        seen.add(key)
         tuples.append({
             "recipe_id": fb.get("recipe_id", "feedback"),
             "original": fb["original"],
@@ -127,6 +152,7 @@ with open("$FEEDBACK_TUPLES", "w") as f:
     json.dump(tuples, f)
 
 print(f"  {len(tuples)} positive tuples from feedback")
+print(f"  (deduplicated from {len(accepts)} accepts, removed {len(contradictions)} contradictions)")
 CONVERT_EOF
 
 # =========================================================================
