@@ -3,7 +3,7 @@
   "title": "ForkWise Substitution Service",
   "timezone": "browser",
   "schemaVersion": 38,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "time": {
     "from": "now-30m",
@@ -16,7 +16,7 @@
       "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{handler=~\"/substitute|/predict\"}[1m]))",
+          "expr": "sum(rate(http_requests_total{handler=~\"/substitute|/predict\"}[5m]))",
           "legendFormat": "requests/sec",
           "refId": "A"
         }
@@ -37,39 +37,83 @@
           "refId": "A"
         },
         {
-          "expr": "1000 * histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[5m])) by (le))",
+          "expr": "1000 * histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[5m])) by (le))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "1000 * histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[5m])) by (le))",
+          "expr": "1000 * histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[5m])) by (le))",
           "legendFormat": "p99",
           "refId": "C"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ms" }
+        "defaults": { "unit": "ms" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p99" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p95" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p50" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          }
+        ]
       },
-      "datasource": "prometheus"
+      "datasource": "prometheus",
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          { "color": "green", "value": null },
+          { "color": "yellow", "value": 500 },
+          { "color": "red", "value": 1000 }
+        ]
+      }
     },
     {
       "type": "timeseries",
-      "title": "Error Responses per Second",
+      "title": "Error Rate (%)",
       "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{handler=~\"/substitute|/predict\", status=~\"4..|5..\"}[1m]))",
-          "legendFormat": "errors/sec",
+          "expr": "100 * sum(rate(http_requests_total{handler=~\"/substitute|/predict\", status=~\"4..|5..\"}[5m])) / sum(rate(http_requests_total{handler=~\"/substitute|/predict\"}[5m]))",
+          "legendFormat": "error %",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
-          "color": { "mode": "fixed", "fixedColor": "red" }
+          "unit": "percent",
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 10 }
+            ]
+          }
         }
       },
-      "datasource": "prometheus"
+      "datasource": "prometheus",
+      "alert": {
+        "name": "High Error Rate",
+        "message": "Substitution API error rate exceeds 10% for 5 minutes. Consider rollback.",
+        "conditions": [
+          {
+            "type": "query",
+            "query": { "params": ["A", "5m", "now"] },
+            "reducer": { "type": "avg" },
+            "evaluator": { "type": "gt", "params": [10] }
+          }
+        ],
+        "frequency": "1m",
+        "for": "5m"
+      }
     },
     {
       "type": "stat",
@@ -105,11 +149,11 @@
     },
     {
       "type": "timeseries",
-      "title": "Feedback Accept vs Reject Rate",
+      "title": "Feedback Rate",
       "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{handler=\"/feedback\", status=\"200\"}[5m]))",
+          "expr": "sum(rate(http_requests_total{handler=\"/feedback\"}[5m]))",
           "legendFormat": "feedback/sec",
           "refId": "A"
         }
@@ -121,7 +165,7 @@
     },
     {
       "type": "table",
-      "title": "Pod Resource Usage",
+      "title": "Pod Resource Usage (MB)",
       "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
       "targets": [
         {
@@ -134,6 +178,93 @@
       ],
       "fieldConfig": {
         "defaults": { "unit": "decmbytes" }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency Alert: p95 > 1s",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{handler=~\"/substitute|/predict\"}[5m])) by (le))",
+          "legendFormat": "p95 latency (s)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 1.0 }
+            ]
+          }
+        }
+      },
+      "datasource": "prometheus",
+      "alert": {
+        "name": "High Latency",
+        "message": "Substitution API p95 latency exceeds 1 second for 5 minutes.",
+        "conditions": [
+          {
+            "type": "query",
+            "query": { "params": ["A", "5m", "now"] },
+            "reducer": { "type": "avg" },
+            "evaluator": { "type": "gt", "params": [1.0] }
+          }
+        ],
+        "frequency": "1m",
+        "for": "5m"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Pod Restarts (last 24h)",
+      "gridPos": { "x": 12, "y": 24, "w": 6, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=~\"forkwise-.*\"}[24h]))",
+          "legendFormat": "restarts",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "datasource": "prometheus"
+    },
+    {
+      "type": "stat",
+      "title": "GISMo Model Active",
+      "gridPos": { "x": 18, "y": 24, "w": 6, "h": 6 },
+      "targets": [
+        {
+          "expr": "up{job=\"substitution-api\"}",
+          "legendFormat": "API up",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
+          ]
+        }
       },
       "datasource": "prometheus"
     }
