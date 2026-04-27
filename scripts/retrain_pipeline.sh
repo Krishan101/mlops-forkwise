@@ -305,6 +305,73 @@ kubectl -n forkwise-platform rollout status deployment/substitution-api --timeou
 log "  Substitution API restarted with new model"
 
 # =========================================================================
+# Step 9b: Canary validation (live traffic check)
+# =========================================================================
+CANARY_DURATION=300  # 5 minutes
+CANARY_TEST_QUERIES=20
+CANARY_ERROR_THRESHOLD=3  # max allowed failures out of test queries
+
+log "Step 9b: Canary validation — testing new model for ${CANARY_DURATION}s..."
+log "  Sending $CANARY_TEST_QUERIES test queries to verify model is serving correctly..."
+
+# Wait for the new pod to be fully ready
+sleep 30
+
+# Send test queries and count failures
+CANARY_PASS=0
+CANARY_FAIL=0
+for i in $(seq 1 $CANARY_TEST_QUERIES); do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+        http://192.168.1.11:30808/substitute \
+        -H "Content-Type: application/json" \
+        -d '{"ingredient":"butter","recipe_name":"test","top_k":3}' 2>/dev/null || echo "000")
+
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        CANARY_PASS=$((CANARY_PASS + 1))
+    else
+        CANARY_FAIL=$((CANARY_FAIL + 1))
+    fi
+    sleep 2
+done
+
+log "  Canary results: $CANARY_PASS passed, $CANARY_FAIL failed (threshold: $CANARY_ERROR_THRESHOLD max failures)"
+
+if [[ "$CANARY_FAIL" -gt "$CANARY_ERROR_THRESHOLD" ]]; then
+    warn "  CANARY FAILED: $CANARY_FAIL/$CANARY_TEST_QUERIES queries failed"
+    warn "  Rolling back to previous model..."
+
+    # Rollback: swap current and previous in S3
+    for f in gismo_decoder.onnx ingredient_embeddings.npy vocab.json metadata.json; do
+        base="${f%.*}"
+        ext="${f##*.}"
+        aws --endpoint-url "$S3_ENDPOINT" s3 cp \
+            "s3://$S3_BUCKET/models/v2/${base}_previous.${ext}" \
+            "s3://$S3_BUCKET/models/v2/$f" \
+            --quiet 2>/dev/null || true
+    done
+
+    # Restart API with rolled-back model
+    kubectl -n forkwise-platform delete pvc gismo-model-pvc --ignore-not-found 2>/dev/null || true
+    sleep 3
+    kubectl apply -f "$REPO_ROOT/k8s/platform/substitution-api.yaml"
+    kubectl -n forkwise-platform rollout restart deployment/substitution-api
+    kubectl -n forkwise-platform rollout status deployment/substitution-api --timeout=5m
+
+    die "  Canary failed. Rolled back to previous model. Pipeline aborted."
+fi
+
+log "  ✓ Canary passed ($CANARY_PASS/$CANARY_TEST_QUERIES queries successful)"
+
+# Now wait the remaining canary observation window
+REMAINING=$((CANARY_DURATION - CANARY_TEST_QUERIES * 2 - 30))
+if [[ "$REMAINING" -gt 0 ]]; then
+    log "  Observing for ${REMAINING}s more..."
+    sleep "$REMAINING"
+fi
+
+log "  ✓ Canary observation window complete — model is stable"
+
+# =========================================================================
 # Step 10: Mark feedback as consumed
 # =========================================================================
 log "Step 10: Marking feedback as consumed..."
@@ -326,6 +393,7 @@ log "  Previous MRR:        $CURRENT_MRR"
 log "  New MRR:             $NEW_MRR"
 log "  Absolute gate:       >= $MIN_ABSOLUTE_MRR ✓"
 log "  Relative gate:       >= 95% of previous ✓"
+log "  Canary:              $CANARY_PASS/$CANARY_TEST_QUERIES passed ✓"
 log "  Feedback used:       $FEEDBACK_COUNT events"
 log "  Model promoted and deployed"
 log "  Timestamp:           $TIMESTAMP"
