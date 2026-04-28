@@ -11,10 +11,16 @@ data:
     echo "=== ForkWise Retrain Check ==="
     echo "Time: $(date -u)"
 
+    # Install required tools
+    echo "Installing dependencies..."
+    apt-get update -qq && apt-get install -y -qq postgresql-client openssh-client curl > /dev/null 2>&1
+    pip install awscli -q > /dev/null 2>&1
+
     # Config
     FEEDBACK_THRESHOLD="${FEEDBACK_THRESHOLD:-50}"
     GPU_HOST="${GPU_HOST}"
     SSH_KEY_PATH="/root/.ssh/forkwise-key"
+    chmod 600 "$SSH_KEY_PATH" 2>/dev/null || true
     S3_ENDPOINT="https://chi.tacc.chameleoncloud.org:7480"
     S3_BUCKET="data-proj01"
 
@@ -84,11 +90,11 @@ data:
     MLFLOW_URI="http://mlflow.forkwise-platform:5000"
 
     echo "Starting training on GPU..."
-    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "docker run --rm --gpus all \
+    ( ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "docker run --rm --gpus all \
       -v ~/training/data:/app/data -v ~/training/output:/app/output \
       gismo-train --data-dir /app/data --output-dir /app/output \
       --max-epochs 30 --patience 8 --eval-candidates 100 --batch-size 512 \
-      --num-neg 32 --emb-dim 300 --lr 2e-4 --mlflow-uri $MLFLOW_URI"
+      --num-neg 32 --emb-dim 300 --lr 2e-4 --mlflow-uri $MLFLOW_URI" ) || true
 
     echo "Generating artifacts..."
     ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "sudo chown -R cc:cc ~/training/output && \
@@ -104,6 +110,15 @@ data:
 
     echo "Current MRR: $CURRENT_MRR, New MRR: $NEW_MRR"
 
+    # Quality gate 1: absolute minimum
+    MIN_ABSOLUTE_MRR=10.0
+    PASSES_ABSOLUTE=$(python3 -c "print('yes' if float('$NEW_MRR') >= $MIN_ABSOLUTE_MRR else 'no')")
+    if [ "$PASSES_ABSOLUTE" = "no" ]; then
+        echo "QUALITY GATE FAILED: MRR $NEW_MRR below absolute minimum $MIN_ABSOLUTE_MRR"
+        exit 0
+    fi
+
+    # Quality gate 2: relative
     SHOULD_PROMOTE=$(python3 -c "print('yes' if float('$NEW_MRR') >= float('$CURRENT_MRR') * 0.95 else 'no')")
 
     if [ "$SHOULD_PROMOTE" = "no" ]; then
@@ -221,7 +236,7 @@ spec:
             - { name: POSTGRES_DB, value: "forkwise_mlops" }
             - { name: POSTGRES_USER, value: "forkwise" }
             - { name: POSTGRES_PASSWORD, value: "forkwise-secret-pw" }
-            - { name: GPU_HOST, value: "129.114.25.172" }
+            - { name: GPU_HOST, value: "192.5.87.187" }
             - { name: FEEDBACK_THRESHOLD, value: "50" }
             - { name: AWS_ACCESS_KEY_ID, value: "8921c48faf83433db2b1439a9b2889fd" }
             - { name: AWS_SECRET_ACCESS_KEY, value: "7d1ce78efc5a48019888c9f3fa8ba2dd" }
