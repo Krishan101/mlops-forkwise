@@ -128,6 +128,8 @@ mlops-forkwise/
 │   ├── retrain_pipeline.sh          # End-to-end: feedback → merge → train → quality gates → promote
 │   ├── load_generator.sh            # Emulated user traffic for operation period
 │   ├── seed_feedback.py             # Generate test feedback data
+│   ├── seed_mealie.py               # Seed 20 real Recipe1M recipes (with known subs)
+│   ├── add_recipes.py               # Add 20 diverse test recipes via Mealie API
 │   ├── fixup_artifacts.py           # Generate embeddings/vocab/metadata post-training
 │   ├── upload_gismo_model.sh        # Upload model to object store
 │   ├── backup.sh                    # Snapshot state to S3
@@ -171,7 +173,49 @@ bash scripts/bring_up.sh
 
 This deploys all K8s resources, restores from S3 backups if they exist, sets up monitoring, deploys the GISMo ServiceMonitor and retraining CronJob.
 
-### Step 5: Build substitution API image (first time only)
+**Known issue:** The security group section in `bring_up.sh` may hang on Chameleon's shared project. If it stalls at "ensuring security groups exist", Ctrl+C and skip it — SGs are already created by the provision notebook's Terraform. Remove the SG section with:
+```bash
+sed -n '1,/# --- 0b. Security Groups ---/p' scripts/bring_up.sh > /tmp/bu_fixed.sh
+sed -n '/# --- Check for existing backups ---/,$p' scripts/bring_up.sh >> /tmp/bu_fixed.sh
+cp /tmp/bu_fixed.sh scripts/bring_up.sh && chmod +x scripts/bring_up.sh
+bash scripts/bring_up.sh
+```
+
+### Step 5: Post-bring-up steps
+
+```bash
+# Fix service port name for Prometheus scraping
+kubectl -n forkwise-platform patch svc substitution-api --type='json' \
+  -p='[{"op": "replace", "path": "/spec/ports/0", "value": {"name": "http", "port": 8080, "targetPort": 8080, "nodePort": 30808, "protocol": "TCP"}}]'
+
+# Create Mealie user account (if fresh deploy without backup)
+# Go to http://<FLOATING_IP>:30900 and create account
+
+# Seed recipes (if fresh deploy without backup)
+pip install boto3 --break-system-packages -q
+python3 scripts/seed_mealie.py      # 20 real Recipe1M recipes
+python3 scripts/add_recipes.py      # 20 diverse test recipes
+
+# Wait for ingest + feature worker (~90s)
+sleep 90
+
+# Fix ingredient reference_ids for Mealie substitution buttons
+kubectl -n forkwise-app exec deploy/mealie-db -- psql -U mealie -d mealie -c \
+    "UPDATE recipes_ingredients SET reference_id = gen_random_uuid() WHERE reference_id IS NULL;"
+
+# Seed feedback for retraining
+python3 scripts/seed_feedback.py
+
+# Import Grafana dashboard
+# Go to http://<FLOATING_IP>:30300 → Dashboards → New → Import
+# Paste contents of k8s/monitoring/grafana-dashboard.json
+
+# Start load generator (in tmux for persistence)
+tmux new -s loadgen -d "bash scripts/load_generator.sh --duration 604800 --rate 0.3"
+
+# Run backup to persist state
+bash scripts/backup.sh
+```
 
 ```bash
 cd ~/mlops-forkwise/services/substitution-api
@@ -237,6 +281,9 @@ bash scripts/retrain_pipeline.sh <GPU_IP>
 - Latency alert: fires if p95 > 1 second for 5 minutes
 - Pod restarts (last 24h)
 - GISMo model active status
+- GISMo score drift (average top score over time)
+- Unknown ingredient rate (vocabulary coverage drift)
+- Feedback accept rate (user satisfaction drift signal)
 
 **Autoscaling:** HPA scales the substitution API from 1 to 3 replicas at 70% CPU utilization.
 
@@ -267,8 +314,12 @@ See `docs/SAFEGUARDING.md` for the full safeguarding plan covering:
 
 ## Known Issues
 
+- **`bring_up.sh` SG section may hang:** On Chameleon's shared project, the OpenStack security group enumeration is slow. If it hangs at "ensuring security groups exist", skip the SG section (see Step 4 above). SGs are created by Terraform during provisioning.
 - **Mealie `reference_id` bug:** `bring_up.sh` fixes this automatically. For new recipes added after deployment: `kubectl -n forkwise-app exec deploy/mealie-db -- psql -U mealie -d mealie -c "UPDATE recipes_ingredients SET reference_id = gen_random_uuid() WHERE reference_id IS NULL"`
 - **IPv6 on Chameleon:** `bring_up.sh` handles this. For manual builds: `sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1`
 - **Disk space:** Run `docker system prune -a -f` before building if disk is low on node1.
-- **GPU dependency:** The retraining CronJob requires an active GPU lease with SSH access. If no GPU is available, the CronJob exits gracefully.
-- **ONNX validation crash:** The training script's ONNX validation step may crash due to a cuda/cpu device mismatch. The ONNX file is saved correctly before the crash; `fixup_artifacts.py` handles the remaining artifacts.
+- **GPU dependency:** The retraining CronJob requires an active GPU lease with SSH access. If no GPU is available, the CronJob exits gracefully. Update the GPU IP with: `kubectl -n forkwise-platform edit cronjob retrain-check` (change GPU_HOST env var).
+- **ONNX validation crash:** The training script's ONNX validation step may crash due to a cuda/cpu device mismatch. The pipeline tolerates this with `|| true` and `fixup_artifacts.py` generates the remaining artifacts.
+- **Prometheus service port:** After pod restarts, verify the service has a named port: `kubectl -n forkwise-platform get svc substitution-api -o yaml | grep "name: http"`. If missing, patch it (see Step 5 above).
+- **Grafana dashboard import:** The dashboard definition lives in `k8s/monitoring/grafana-dashboard.json` and must be imported manually via Grafana UI after each fresh deployment.
+- **Floating IP changes:** Each new lease gets a new floating IP. Update all shared URLs after provisioning.
