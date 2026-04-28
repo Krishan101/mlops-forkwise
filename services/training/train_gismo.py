@@ -637,7 +637,7 @@ def main():
         })[0]
 
         torch_out = model.decoder(
-            torch.tensor(test_src), torch.tensor(test_cand), torch.tensor(test_ctx)
+            torch.tensor(test_src).to(device), torch.tensor(test_cand).to(device), torch.tensor(test_ctx).to(device)
         ).detach().cpu().numpy()
 
         max_diff = np.max(np.abs(onnx_out - torch_out))

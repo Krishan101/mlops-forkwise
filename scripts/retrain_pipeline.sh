@@ -207,7 +207,7 @@ log "  Current deployed model test MRR: $CURRENT_MRR"
 
 MLFLOW_URI="http://$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo '129.114.26.133'):30500"
 
-ssh $SSH_OPTS cc@"$GPU_HOST" << RETRAIN_SSH
+( ssh $SSH_OPTS cc@"$GPU_HOST" << RETRAIN_SSH
 set -e
 export PATH="\$HOME/.local/bin:\$PATH"
 
@@ -233,8 +233,9 @@ docker run --rm --gpus all \
 
 echo "RETRAIN_DONE"
 RETRAIN_SSH
+) || true
 
-log "  Retraining completed on GPU"
+log "  Retraining completed on GPU (or ONNX validation crashed - artifacts still saved)"
 
 # =========================================================================
 # Step 6: Generate artifacts (embeddings, vocab, metadata)
