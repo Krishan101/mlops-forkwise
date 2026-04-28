@@ -56,7 +56,7 @@ The substitution model follows the [GISMo paper](https://arxiv.org/abs/2302.0796
 - SSH key on local machine: `C:\Users\Krishan Guta\.ssh\forkwise_key`
 - Project prefix: `proj01`
 
-**Object Store (CHI@TACC):**
+**Object Store (CHI@TACC).:**
 - Endpoint: `https://chi.tacc.chameleoncloud.org:7480`
 - Access Key: `8921c48faf83433db2b1439a9b2889fd`
 - Secret Key: `7d1ce78efc5a48019888c9f3fa8ba2dd`
