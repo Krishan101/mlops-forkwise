@@ -87,7 +87,7 @@ data:
     echo "Cleaning previous output on GPU..."
     ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "sudo chown -R cc:cc ~/training/output 2>/dev/null; rm -f ~/training/output/*"
 
-    MLFLOW_URI="http://mlflow.forkwise-platform:5000"
+    MLFLOW_URI="http://129.114.27.120:30500"
 
     echo "Starting training on GPU..."
     ( ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no cc@"$GPU_HOST" "docker run --rm --gpus all \
