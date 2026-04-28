@@ -60,7 +60,7 @@ spec:
           mountPath: /model
       containers:
       - name: substitution-api
-        image: ghcr.io/krishan101/forkwise-substitution-api:0.2.0
+        image: ghcr.io/krishan101/forkwise-substitution-api:0.2.2
         imagePullPolicy: Always
         ports: [{ containerPort: 8080 }]
         env:
