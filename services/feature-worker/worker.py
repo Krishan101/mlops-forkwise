@@ -137,7 +137,6 @@ def main():
                 row = cur.fetchone()
 
                 if row is None:
-                    conn.close()
                     time.sleep(POLL_INTERVAL)
                     continue
 
@@ -160,12 +159,15 @@ def main():
                     )
                     conn.commit()
                     log.error(f"  [failed] {recipe_id}: {exc}")
-
-            conn.close()
-
         except psycopg2.OperationalError as exc:
             log.error(f"postgres connection error: {exc}. retrying in {POLL_INTERVAL}s")
             time.sleep(POLL_INTERVAL)
+        except Exception as exc:
+            log.error(f"unexpected worker error: {exc}. retrying in {POLL_INTERVAL}s")
+            time.sleep(POLL_INTERVAL)
+        finally:
+            if conn is not None and not conn.closed:
+                conn.close()
 
 
 if __name__ == "__main__":
